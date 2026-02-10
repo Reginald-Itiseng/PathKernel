@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""File import/parsing helpers for Gerber and Excellon inputs."""
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -68,6 +70,7 @@ def _metadata(path: Path, kind: str, parsed: Any) -> dict[str, str]:
 
 
 def parse_file(path: Path, project: Project) -> ParsedFile:
+    """Parse a CAM file and return a populated Layer model entry."""
     kind = detect_kind(path)
     try:
         import gerber

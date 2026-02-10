@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+"""Main application window.
+
+This file coordinates file import, project model updates, and scene rebuilds.
+"""
+
 from pathlib import Path
 import logging
 
@@ -18,7 +23,6 @@ from PySide6.QtWidgets import (
 
 from app.core.io import import_files, scan_folder
 from app.core.project import Layer, Project
-from app.core.render import LayerRenderer
 from app.ui.widgets import FitToolbar, GraphicsCanvas, LayerPanel
 
 
@@ -26,13 +30,14 @@ LOGGER = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
+    """Top-level UI shell for CAM layer import and inspection."""
+
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("PathKernel Viewer")
         self.resize(1280, 840)
 
         self.project = Project()
-        self.renderer = LayerRenderer()
         self.scene_items: dict[int, object] = {}
 
         self.canvas = GraphicsCanvas(self)
@@ -126,27 +131,35 @@ class MainWindow(QMainWindow):
         if not paths:
             return
 
+        # Batch UI updates during import to avoid visible repaints per file/layer.
         self.setUpdatesEnabled(False)
         try:
             for path in paths:
                 try:
-                    layers = import_files([path], self.project)
-                    for layer in layers:
-                        self._render_layer(layer)
+                    import_files([path], self.project)
                 except Exception as exc:
                     LOGGER.exception("Import failed for %s", path)
                     QMessageBox.warning(self, "Import Failed", str(exc))
+            self._rebuild_scene()
             self.layer_panel.set_layers(self.project.layers)
             self.canvas.fit_scene()
         finally:
             self.setUpdatesEnabled(True)
 
     def _render_layer(self, layer: Layer) -> None:
-        result = self.renderer.render(layer)
-        item = self.canvas.add_artifact(result.artifact)
+        item = self.canvas.add_layer(layer)
         if not layer.visible:
             item.setVisible(False)
         self.scene_items[self.project.layers.index(layer)] = item
+
+    def _rebuild_scene(self) -> None:
+        # Rebuild from model state for deterministic draw order and visibility.
+        self.scene_items.clear()
+        self.canvas.clear_scene()
+        for idx, layer in enumerate(self.project.layers):
+            item = self.canvas.add_layer(layer)
+            item.setVisible(layer.visible)
+            self.scene_items[idx] = item
 
     def _on_layer_visibility_changed(self, index: int, visible: bool) -> None:
         self.project.set_visibility(index, visible)

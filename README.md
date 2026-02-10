@@ -12,7 +12,7 @@ PathKernel is a Python desktop CAM/viewer scaffold for PCB fabrication files. Th
 - Canvas with zoom (mouse wheel), pan (middle mouse drag), and fit-to-view
 - Status bar cursor coordinates (mm, approximate) and zoom level
 - Per-layer metadata panel
-- Render cache in `.cache/renders/`
+- Direct primitive rendering in the viewport (no SVG artifact stacking in active path)
 
 ## Requirements
 
@@ -80,7 +80,8 @@ PathKernel/
 ## Notes and Limitations
 
 - This is an import/view milestone only. No toolpath generation or CAM operations yet.
-- Rendering relies on `pcb-tools` + Cairo backend support; if SVG export fails, the app falls back to PNG artifacts.
+- Rendering currently uses direct primitive drawing in Qt for better viewport responsiveness.
+- Some aperture-macro edge cases are still being refined.
 - Coordinate display is scene-based and currently approximate in mm.
 - No bundled sample CAM files are included. Use your own test Gerber/Excellon outputs.
 
@@ -88,3 +89,9 @@ PathKernel/
 
 Logging is enabled at INFO level in `app/main.py`.
 Import/render failures are surfaced with Qt error dialogs and logs.
+
+## Developer Docs
+
+- `docs/ARCHITECTURE.md`
+- `docs/RENDERING.md`
+- `docs/DEBUGGING.md`
