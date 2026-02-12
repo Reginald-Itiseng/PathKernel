@@ -9,10 +9,26 @@ PathKernel is a Python desktop CAM/viewer scaffold for PCB fabrication files. Th
 - Import Excellon drill files (`.DRL`, `.TXT`, `.XLN`, `.DRD`)
 - Open individual files or scan a folder
 - Layer list with visibility toggles and per-layer color
+- Layer opacity control, quick color picker, and layer reordering
+- Solo/mute-others visibility shortcuts
+- Layer role assignment (`top`, `bottom`, `holes`, `cutout`) for workflow organization
+- Viewport layer selection by click or drag-box (multi-select)
+- Live selected-layer bounding box overlay in viewport
+- Parameters menu with `Tool Library` and `Selected Tools` dialogs
+- `ISO` dock to assign Top/Bottom tools and generate isolation overlay preview
+- ISO dock can export generated isolation polylines to `HPGL` / `HPGL2`
+- Geometry menu for non-destructive manual edits (`Add Pad`, `Add Track`, `Add Hole`)
+  `Add Pad` uses a single property dialog with live preview and optional hole-center snapping.
 - Canvas with zoom (mouse wheel), pan (middle mouse drag), and fit-to-view
 - Status bar cursor coordinates (mm, approximate) and zoom level
 - Per-layer metadata panel
+- Click-to-inspect primitive metadata at cursor hit location
+- Project save/load (`.pkproj.json`) with layer settings and viewport state
+- Origin tool `Set Origin`: click in viewport to set viewport origin.
+- Origin tool `Move To Origin`: move selected circuit layers so bbox min aligns to viewport origin.
+- Undo/redo stack for origin/color/opacity edits
 - Direct primitive rendering in the viewport (no SVG artifact stacking in active path)
+- Optional debug overlay (`View > Debug Overlay`)
 
 ## Requirements
 
@@ -30,6 +46,14 @@ For tests:
 ```bash
 pip install -e .[dev]
 ```
+
+To use the maintained parser backend (`gerbonara`) for Gerber/Excellon import:
+
+```bash
+pip install -e .[maintained-parser]
+```
+
+When installed, PathKernel will prefer `gerbonara` automatically and fall back to `pcb-tools` if unavailable.
 
 ## Run
 
@@ -51,6 +75,12 @@ pathkernel
 4. Use `File > Open Folder` to auto-import known CAM extensions.
 5. Toggle layer visibility in the left dock.
 6. Middle-drag to pan, wheel to zoom, click `Fit` to frame all visible items.
+7. Select a layer and use `Color`, `Up/Down`, `Solo`, `Mute Others`, and opacity slider.
+8. Left-click geometry in canvas to inspect primitive metadata.
+9. Use `File > Save Project...` and `File > Open Project...` to persist workflow state.
+10. Use `Origin > Set Origin` and click canvas to place viewport origin.
+11. Use `Origin > Move To Origin` to move selected layers to that viewport origin.
+12. Use `Edit > Undo/Redo` to revert origin/color/opacity changes.
 
 ## Project Structure
 
@@ -65,21 +95,36 @@ PathKernel/
       widgets.py
     core/
       __init__.py
+      geometry.py
       io.py
       project.py
       render.py
       units.py
     assets/
   tests/
+    test_geometry.py
     test_io.py
     test_project.py
   pyproject.toml
   README.md
+  docs/
 ```
 
 ## Notes and Limitations
 
-- This is an import/view milestone only. No toolpath generation or CAM operations yet.
+- Isolation output is currently a preview overlay only (not G-code export yet).
+- Isolation ring generation (`app/core/isolation.py`) now uses robust polygon offsets:
+  `r0 = tool_diameter/2`, `rk = r0 + k*(tool_diameter*stepover)` or width-driven offsets to
+  satisfy `isolation_width_mm`.
+- Offset backend prefers `pyclipper` (integer robust clipping/offsetting with miter joins and
+  configurable `miter_limit`), with a Qt-path fallback when unavailable.
+- Tunable isolation tolerances in `IsoParams`: `tol_mm`, `min_feature_mm`, `arc_flatten_tol_mm`,
+  and `miter_limit`.
+- Known limitation: when `pyclipper` is unavailable, Qt fallback can be less stable on extreme
+  acute corners or dense near-touching geometry.
+- Tool library supports `flute` and `conical` tools. Conical effective cut width is depth-dependent
+  (`tip_diameter + 2 * depth * tan(angle/2)`), optionally capped by tool diameter.
+- Tool library is persisted to `~/.pathkernel/tool_library.json` across app restarts.
 - Rendering currently uses direct primitive drawing in Qt for better viewport responsiveness.
 - Some aperture-macro edge cases are still being refined.
 - Coordinate display is scene-based and currently approximate in mm.
@@ -95,3 +140,19 @@ Import/render failures are surfaced with Qt error dialogs and logs.
 - `docs/ARCHITECTURE.md`
 - `docs/RENDERING.md`
 - `docs/DEBUGGING.md`
+- `docs/REGRESSION_PACK.md`
+- `docs/TRANSFORMS.md`
+
+## Regression Workflow
+
+Generate baseline from local known-good files:
+
+```bash
+python tools/generate_regression_baseline.py --out tests/regression/lumacore_baseline.json <file1> <file2> ...
+```
+
+Run regression check:
+
+```bash
+python -m pytest -q tests/test_regression_pack.py
+```

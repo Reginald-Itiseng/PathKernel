@@ -1,0 +1,62 @@
+{
+  "version": 1,
+  "viewport": {
+    "center_x": 77.76602578886481,
+    "center_y": 9.459516574034474,
+    "zoom": 9.091373679291635
+  },
+  "layers": [
+    {
+      "path": "D:\\MorpheusRegIndustries\\MoonLamp\\LED_driver\\PD_jobs\\PowerDistribution-Edge_Cuts.gbr",
+      "name": "PowerDistribution-Edge_Cuts",
+      "kind": "gerber",
+      "visible": true,
+      "color": "#d32f2f",
+      "opacity": 1.0,
+      "role": "cutout",
+      "primitive_overrides": {},
+      "offset_x_mm": -89.476777,
+      "offset_y_mm": 98.546646,
+      "rotation_deg": 0.0,
+      "mirror_x": false,
+      "mirror_y": false,
+      "manual_edits": []
+    },
+    {
+      "path": "D:\\MorpheusRegIndustries\\MoonLamp\\LED_driver\\PD_jobs\\PowerDistribution-F_Cu.gbr",
+      "name": "PowerDistribution-F_Cu",
+      "kind": "gerber",
+      "visible": true,
+      "color": "#1976d2",
+      "opacity": 1.0,
+      "role": "top",
+      "primitive_overrides": {},
+      "offset_x_mm": -89.476777,
+      "offset_y_mm": 98.546646,
+      "rotation_deg": 0.0,
+      "mirror_x": false,
+      "mirror_y": false,
+      "manual_edits": []
+    },
+    {
+      "path": "D:\\MorpheusRegIndustries\\MoonLamp\\LED_driver\\PD_jobs\\PowerDistribution.drl",
+      "name": "PowerDistribution",
+      "kind": "excellon",
+      "visible": true,
+      "color": "#388e3c",
+      "opacity": 1.0,
+      "role": "holes",
+      "primitive_overrides": {},
+      "offset_x_mm": -89.476777,
+      "offset_y_mm": 98.546646,
+      "rotation_deg": 0.0,
+      "mirror_x": false,
+      "mirror_y": false,
+      "manual_edits": []
+    }
+  ],
+  "workspace": {
+    "origin_x_mm": 0.0,
+    "origin_y_mm": 0.0
+  }
+}

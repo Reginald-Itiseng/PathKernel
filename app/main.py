@@ -18,6 +18,8 @@ def configure_logging() -> None:
 def main() -> int:
     configure_logging()
     app = QApplication(sys.argv)
+    app.setOrganizationName("PathKernel")
+    app.setApplicationName("PathKernel")
     window = MainWindow()
     window.show()
     return app.exec()
@@ -25,4 +27,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
