@@ -34,6 +34,14 @@ EXCELLON_EXTENSIONS = {
     ".drd",
 }
 
+ROLE_DEFAULT_STYLE = {
+    # KiCad-like copper colors with reduced opacity for overlap visibility.
+    "top": ("#C83434", 0.78),
+    "bottom": ("#4D7FC4", 0.78),
+    "holes": ("#D8A33D", 0.95),
+    "cutout": ("#B8C0CC", 0.95),
+}
+
 
 @dataclass(slots=True)
 class ParsedFile:
@@ -198,6 +206,7 @@ def parse_file(path: Path, project: Project) -> ParsedFile:
         raise ValueError(f"Failed to parse '{path.name}': {exc}") from exc
 
     role = _guess_role(path, kind)
+    color, opacity = _style_for_role(role, project)
     meta = _metadata(path, kind, parsed)
     meta["parser_backend"] = backend
     layer = Layer(
@@ -205,12 +214,20 @@ def parse_file(path: Path, project: Project) -> ParsedFile:
         path=path,
         kind=kind,
         source=parsed,
-        color=project.next_color(),
+        color=color,
+        opacity=opacity,
         role=role if role in LAYER_ROLES else "unassigned",
         bbox=_extract_bbox(parsed),
         metadata=meta,
     )
     return ParsedFile(layer=layer)
+
+
+def _style_for_role(role: str, project: Project) -> tuple[str, float]:
+    style = ROLE_DEFAULT_STYLE.get(role)
+    if style is not None:
+        return style
+    return project.next_color(), 1.0
 
 
 def _parse_with_best_backend(path: Path, kind: str) -> tuple[Any, str]:

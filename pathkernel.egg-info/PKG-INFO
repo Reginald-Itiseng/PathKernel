@@ -8,6 +8,7 @@ Description-Content-Type: text/markdown
 Requires-Dist: PySide6<7.0,>=6.6
 Requires-Dist: pcb-tools>=0.1.6
 Requires-Dist: pyclipper>=1.3.0.post6
+Requires-Dist: shapely>=2.0
 Provides-Extra: maintained-parser
 Requires-Dist: gerbonara @ git+https://github.com/jaseg/gerbonara.git ; extra == "maintained-parser"
 Provides-Extra: dev

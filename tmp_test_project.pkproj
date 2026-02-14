@@ -1,0 +1,72 @@
+{
+  "version": 1,
+  "workspace": {
+    "origin_x_mm": 0.0,
+    "origin_y_mm": 0.0
+  },
+  "layers": [
+    {
+      "name": "t",
+      "path": "missing.gbr",
+      "kind": "gerber",
+      "visible": true,
+      "color": "#1976d2",
+      "opacity": 1.0,
+      "offset_x_mm": 0.0,
+      "offset_y_mm": 0.0,
+      "rotation_deg": 0.0,
+      "mirror_x": false,
+      "mirror_y": false,
+      "role": "unassigned",
+      "primitive_overrides": {},
+      "manual_edits": [],
+      "bbox": null,
+      "rendered_artifact_path": null,
+      "metadata": {
+        "k": "v"
+      },
+      "source": {
+        "units": "mm",
+        "bounds": {
+          "__list__": [
+            {
+              "__list__": [
+                0.0,
+                10.0
+              ]
+            },
+            {
+              "__list__": [
+                0.0,
+                5.0
+              ]
+            }
+          ]
+        },
+        "primitives": [
+          {
+            "class_name": "Line",
+            "attrs": {
+              "diameter": 0.2,
+              "end": {
+                "__list__": [
+                  1,
+                  1
+                ]
+              },
+              "flashed": false,
+              "level_polarity": "dark",
+              "start": {
+                "__list__": [
+                  0,
+                  0
+                ]
+              }
+            }
+          }
+        ]
+      },
+      "embedded_file": null
+    }
+  ]
+}
