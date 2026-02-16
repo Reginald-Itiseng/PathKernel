@@ -1,0 +1,238 @@
+[2026-02-15 15:09:11] geometry-debug renderer=pyqtgraph
+click_mm=(56.012840,-34.205618)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:106
+primitive_index=106
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Circle': 1}
+scoped_bounds_mm=(54.200000,-35.319715)-(56.400000,-33.120285)
+hit_info={flashed=True, group_id=primitive:106, layer_index=1, level_polarity=dark, primitive_index=106, primitive_type=Circle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:09:47] geometry-debug renderer=pyqtgraph
+click_mm=(45.387798,-35.277580)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:261
+primitive_index=261
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Rectangle': 1}
+scoped_bounds_mm=(44.950000,-36.350000)-(46.125000,-34.900000)
+hit_info={flashed=True, group_id=primitive:261, layer_index=1, level_polarity=dark, primitive_index=261, primitive_type=Rectangle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:09:50] geometry-debug renderer=pyqtgraph
+click_mm=(45.387798,-35.277580)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:261
+primitive_index=261
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Rectangle': 1}
+scoped_bounds_mm=(44.950000,-36.350000)-(46.125000,-34.900000)
+hit_info={flashed=True, group_id=primitive:261, layer_index=1, level_polarity=dark, primitive_index=261, primitive_type=Rectangle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:09:51] geometry-debug renderer=pyqtgraph
+click_mm=(45.576968,-31.494183)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:411
+primitive_index=411
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Polygon': 1}
+scoped_bounds_mm=(29.393657,-56.549500)-(105.049500,-5.550500)
+hit_info={flashed=True, group_id=primitive:411, layer_index=1, level_polarity=dark, primitive_index=411, primitive_type=Polygon, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:09:53] geometry-debug renderer=pyqtgraph
+click_mm=(37.916095,-31.517172)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:212
+primitive_index=212
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Rectangle': 1}
+scoped_bounds_mm=(37.812500,-31.882500)-(39.762500,-31.082500)
+hit_info={flashed=True, group_id=primitive:212, layer_index=1, level_polarity=dark, primitive_index=212, primitive_type=Rectangle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:09:57] geometry-debug renderer=pyqtgraph
+click_mm=(87.048607,-18.001459)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:181
+primitive_index=181
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Rectangle': 1}
+scoped_bounds_mm=(86.025000,-19.325000)-(87.225000,-17.725000)
+hit_info={flashed=True, group_id=primitive:181, layer_index=1, level_polarity=dark, primitive_index=181, primitive_type=Rectangle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:09:58] geometry-debug renderer=pyqtgraph
+click_mm=(86.228697,-18.493405)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:181
+primitive_index=181
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Rectangle': 1}
+scoped_bounds_mm=(86.025000,-19.325000)-(87.225000,-17.725000)
+hit_info={flashed=True, group_id=primitive:181, layer_index=1, level_polarity=dark, primitive_index=181, primitive_type=Rectangle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:10:01] geometry-debug renderer=pyqtgraph
+click_mm=(98.592735,-34.407385)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:411
+primitive_index=411
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Polygon': 1}
+scoped_bounds_mm=(29.393657,-56.549500)-(105.049500,-5.550500)
+hit_info={flashed=True, group_id=primitive:411, layer_index=1, level_polarity=dark, primitive_index=411, primitive_type=Polygon, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:10:02] geometry-debug renderer=pyqtgraph
+click_mm=(98.083444,-33.878875)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:411
+primitive_index=411
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Polygon': 1}
+scoped_bounds_mm=(29.393657,-56.549500)-(105.049500,-5.550500)
+hit_info={flashed=True, group_id=primitive:411, layer_index=1, level_polarity=dark, primitive_index=411, primitive_type=Polygon, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:10:03] geometry-debug renderer=pyqtgraph
+click_mm=(98.477424,-33.263882)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:411
+primitive_index=411
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Polygon': 1}
+scoped_bounds_mm=(29.393657,-56.549500)-(105.049500,-5.550500)
+hit_info={flashed=True, group_id=primitive:411, layer_index=1, level_polarity=dark, primitive_index=411, primitive_type=Polygon, shape_kind=fill}
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(58.913003,-17.950990)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(61.493248,-18.163794)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(61.253844,-17.445581)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(60.535632,-17.179577)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(59.897221,-18.216995)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(57.423377,-18.163794)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(56.545562,-17.871189)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(55.720947,-17.285978)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(55.720947,-17.285978)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+geometry-debug-error
+renderer=pyqtgraph
+click_mm=(51.614476,-33.685016)
+error=name 'pt' is not defined
+------------------------------------------------------------------------------
+[2026-02-15 15:22:20] geometry-debug renderer=pyqtgraph
+click_mm=(60.529460,-17.214982)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:190
+primitive_index=190
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Circle': 1}
+overlap_at_click_dark=1
+overlap_at_click_clear=0
+scoped_bounds_mm=(59.660302,-19.099925)-(61.760000,-17.000075)
+hit_info={flashed=True, group_id=primitive:190, layer_index=1, level_polarity=dark, primitive_index=190, primitive_type=Circle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:22:39] geometry-debug renderer=pyqtgraph
+click_mm=(58.069894,-17.214982)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:189
+primitive_index=189
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Circle': 1}
+overlap_at_click_dark=1
+overlap_at_click_clear=0
+scoped_bounds_mm=(57.120302,-19.099925)-(59.220000,-17.000075)
+hit_info={flashed=True, group_id=primitive:189, layer_index=1, level_polarity=dark, primitive_index=189, primitive_type=Circle, shape_kind=fill}
+------------------------------------------------------------------------------
+[2026-02-15 15:22:51] geometry-debug renderer=pyqtgraph
+click_mm=(86.739207,-18.444765)
+hit_layer_index=1
+render_mode=path (contains fill geometry)
+group_id=primitive:181
+primitive_index=181
+scoped_shape_count=1
+scoped_dark_shapes=1
+scoped_clear_shapes=0
+scoped_kind_counts={'fill': 1}
+scoped_primitive_type_counts={'Rectangle': 1}
+overlap_at_click_dark=2
+overlap_at_click_clear=0
+scoped_bounds_mm=(86.025000,-19.325000)-(87.225000,-17.725000)
+hit_info={flashed=True, group_id=primitive:181, layer_index=1, level_polarity=dark, primitive_index=181, primitive_type=Rectangle, shape_kind=fill}
+------------------------------------------------------------------------------

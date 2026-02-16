@@ -1,0 +1,217 @@
+[
+  {
+    "id": "file_open_project",
+    "size": 16,
+    "file": "file_open_project_16.svg"
+  },
+  {
+    "id": "file_save_project",
+    "size": 16,
+    "file": "file_save_project_16.svg"
+  },
+  {
+    "id": "file_save_project_as",
+    "size": 16,
+    "file": "file_save_project_as_16.svg"
+  },
+  {
+    "id": "file_open_gerber",
+    "size": 16,
+    "file": "file_open_gerber_16.svg"
+  },
+  {
+    "id": "file_open_excellon",
+    "size": 16,
+    "file": "file_open_excellon_16.svg"
+  },
+  {
+    "id": "file_open_folder",
+    "size": 16,
+    "file": "file_open_folder_16.svg"
+  },
+  {
+    "id": "file_clear",
+    "size": 16,
+    "file": "file_clear_16.svg"
+  },
+  {
+    "id": "file_exit",
+    "size": 16,
+    "file": "file_exit_16.svg"
+  },
+  {
+    "id": "view_fit",
+    "size": 16,
+    "file": "view_fit_16.svg"
+  },
+  {
+    "id": "view_zoom_in",
+    "size": 16,
+    "file": "view_zoom_in_16.svg"
+  },
+  {
+    "id": "view_zoom_out",
+    "size": 16,
+    "file": "view_zoom_out_16.svg"
+  },
+  {
+    "id": "view_actual_size",
+    "size": 16,
+    "file": "view_actual_size_16.svg"
+  },
+  {
+    "id": "view_grid",
+    "size": 16,
+    "file": "view_grid_16.svg"
+  },
+  {
+    "id": "view_iso_width",
+    "size": 16,
+    "file": "view_iso_width_16.svg"
+  },
+  {
+    "id": "view_iso_centerline",
+    "size": 16,
+    "file": "view_iso_centerline_16.svg"
+  },
+  {
+    "id": "view_cutout_width",
+    "size": 16,
+    "file": "view_cutout_width_16.svg"
+  },
+  {
+    "id": "view_cutout_centerline",
+    "size": 16,
+    "file": "view_cutout_centerline_16.svg"
+  },
+  {
+    "id": "view_renderer_qt",
+    "size": 16,
+    "file": "view_renderer_qt_16.svg"
+  },
+  {
+    "id": "view_renderer_pyqtgraph",
+    "size": 16,
+    "file": "view_renderer_pyqtgraph_16.svg"
+  },
+  {
+    "id": "view_debug_dump",
+    "size": 16,
+    "file": "view_debug_dump_16.svg"
+  },
+  {
+    "id": "tool_generate_isolation",
+    "size": 16,
+    "file": "tool_generate_isolation_16.svg"
+  },
+  {
+    "id": "tool_generate_cutout",
+    "size": 16,
+    "file": "tool_generate_cutout_16.svg"
+  },
+  {
+    "id": "param_tool_library",
+    "size": 16,
+    "file": "param_tool_library_16.svg"
+  },
+  {
+    "id": "param_selected_tools",
+    "size": 16,
+    "file": "param_selected_tools_16.svg"
+  },
+  {
+    "id": "activity_layers",
+    "size": 20,
+    "file": "activity_layers_20.svg"
+  },
+  {
+    "id": "activity_layers",
+    "size": 24,
+    "file": "activity_layers_24.svg"
+  },
+  {
+    "id": "activity_metadata",
+    "size": 20,
+    "file": "activity_metadata_20.svg"
+  },
+  {
+    "id": "activity_metadata",
+    "size": 24,
+    "file": "activity_metadata_24.svg"
+  },
+  {
+    "id": "activity_cutout_planner",
+    "size": 20,
+    "file": "activity_cutout_planner_20.svg"
+  },
+  {
+    "id": "activity_cutout_planner",
+    "size": 24,
+    "file": "activity_cutout_planner_24.svg"
+  },
+  {
+    "id": "layer_delete",
+    "size": 14,
+    "file": "layer_delete_14.svg"
+  },
+  {
+    "id": "layer_delete",
+    "size": 16,
+    "file": "layer_delete_16.svg"
+  },
+  {
+    "id": "cutout_generate",
+    "size": 16,
+    "file": "cutout_generate_16.svg"
+  },
+  {
+    "id": "cutout_close",
+    "size": 16,
+    "file": "cutout_close_16.svg"
+  },
+  {
+    "id": "overlay_close",
+    "size": 12,
+    "file": "overlay_close_12.svg"
+  },
+  {
+    "id": "overlay_close",
+    "size": 14,
+    "file": "overlay_close_14.svg"
+  },
+  {
+    "id": "tool_save",
+    "size": 16,
+    "file": "tool_save_16.svg"
+  },
+  {
+    "id": "tool_mark_undefined",
+    "size": 16,
+    "file": "tool_mark_undefined_16.svg"
+  },
+  {
+    "id": "tool_done",
+    "size": 16,
+    "file": "tool_done_16.svg"
+  },
+  {
+    "id": "drill_add_tool",
+    "size": 14,
+    "file": "drill_add_tool_14.svg"
+  },
+  {
+    "id": "drill_add_tool",
+    "size": 16,
+    "file": "drill_add_tool_16.svg"
+  },
+  {
+    "id": "drill_remove_tool",
+    "size": 14,
+    "file": "drill_remove_tool_14.svg"
+  },
+  {
+    "id": "drill_remove_tool",
+    "size": 16,
+    "file": "drill_remove_tool_16.svg"
+  }
+]

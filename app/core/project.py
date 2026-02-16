@@ -22,6 +22,7 @@ DEFAULT_LAYER_COLORS = [
 ]
 
 LAYER_ROLES = ("unassigned", "top", "bottom", "holes", "cutout")
+TOOL_PROFILES = ("cylindrical/flute", "conical")
 
 
 @dataclass(slots=True)
@@ -80,13 +81,42 @@ class WorkspaceTransform:
 
 
 @dataclass(slots=True)
+class ToolDefinition:
+    slot: int
+    defined: bool = False
+    tool_number: str = ""
+    name: str = ""
+    diameter_mm: float = 0.0
+    profile: str = "cylindrical/flute"
+    angle_deg: float = 0.0
+    tip_diameter_mm: float = 0.0
+    max_rpm: int = 0
+    plunge_mm_s: float = 0.0
+    max_depth_per_pass_mm: float = 0.0
+
+
+def default_tool_library(count: int = 50) -> list[ToolDefinition]:
+    slots = max(1, int(count))
+    return [
+        ToolDefinition(
+            slot=i,
+            defined=False,
+            tool_number=str(i),
+        )
+        for i in range(1, slots + 1)
+    ]
+
+
+@dataclass(slots=True)
 class Project:
     layers: list[Layer] = field(default_factory=list)
     workspace: WorkspaceTransform = field(default_factory=WorkspaceTransform)
+    tool_library: list[ToolDefinition] = field(default_factory=default_tool_library)
     _palette_cycle: Any = field(default_factory=lambda: itertools.cycle(DEFAULT_LAYER_COLORS), init=False)
 
     def clear(self) -> None:
         self.layers.clear()
+        self.tool_library = default_tool_library()
         self._palette_cycle = itertools.cycle(DEFAULT_LAYER_COLORS)
 
     def add_layer(self, layer: Layer) -> Layer:

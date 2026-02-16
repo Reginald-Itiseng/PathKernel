@@ -5,13 +5,22 @@ import traceback
 from typing import Any, Callable
 
 from app.core.cutout import CutoutParams, build_cutout_toolpath_layer, extract_cutout_loops
+from app.core.drilling import DrillToolpathParams, build_drill_toolpath_layer
 from app.core.isolation import IsolationParams, build_isolation_layer
 from app.core.project import Project
 from app.core.project_store import deserialize_layer, serialize_layer
 
 
 def run_task_process_entry(task_name: str, payload: dict[str, Any], out_queue) -> None:
-    """Process entrypoint for long-running geometry tasks."""
+    """Process entrypoint for long-running geometry tasks.
+
+    Queue protocol (dict messages):
+    - {"type": "log", "text": "..."} for progress streaming.
+    - {"type": "result", "result": {...}} for success payload.
+    - {"type": "error", "message": "...", "traceback": "..."} for failures.
+
+    The UI side (`MainWindow`) relies on this exact shape when polling.
+    """
 
     def emit_log(text: str) -> None:
         out_queue.put({"type": "log", "text": str(text)})
@@ -31,6 +40,9 @@ def run_task_process_entry(task_name: str, payload: dict[str, Any], out_queue) -
 
 
 def _run_task(task_name: str, payload: dict[str, Any], emit_log: Callable[[str], None]) -> dict[str, Any]:
+    # Task handlers are intentionally stateless: payload in, serializable payload out.
+    # This keeps multiprocessing boundaries simple and avoids sharing Qt/Shapely objects
+    # between processes.
     if task_name == "isolation_generate":
         source_layer = deserialize_layer(dict(payload["source_layer"]))
         params = IsolationParams(**dict(payload["params"]))
@@ -46,6 +58,12 @@ def _run_task(task_name: str, payload: dict[str, Any], emit_log: Callable[[str],
         source_layer = deserialize_layer(dict(payload["source_layer"]))
         params = CutoutParams(**dict(payload["params"]))
         layer = build_cutout_toolpath_layer(source_layer, Project(), params, log=emit_log)
+        return {"generated_layer": serialize_layer(layer)}
+
+    if task_name == "drill_generate":
+        source_layer = deserialize_layer(dict(payload["source_layer"]))
+        params = DrillToolpathParams(**dict(payload["params"]))
+        layer = build_drill_toolpath_layer(source_layer, Project(), params, log=emit_log)
         return {"generated_layer": serialize_layer(layer)}
 
     raise ValueError(f"Unknown task: {task_name}")
@@ -64,4 +82,8 @@ def cutout_params_payload(params: CutoutParams) -> dict[str, Any]:
 
 
 def isolation_params_payload(params: IsolationParams) -> dict[str, Any]:
+    return asdict(params)
+
+
+def drill_params_payload(params: DrillToolpathParams) -> dict[str, Any]:
     return asdict(params)

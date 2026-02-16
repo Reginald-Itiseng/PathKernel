@@ -1,14 +1,16 @@
 ﻿from __future__ import annotations
 
+from collections import Counter
 from datetime import datetime
 import math
 
-from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QKeyEvent, QMouseEvent, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QWheelEvent
-from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QWidget
+from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QPushButton, QWidget
 
 from app.core.geometry import DrawShape, build_layer_geometry
 from app.core.project import Layer
+from app.ui.icons import icon_for
 
 
 class GraphicsCanvas(QGraphicsView):
@@ -61,6 +63,7 @@ class GraphicsCanvas(QGraphicsView):
         self._task_overlay_lines: list[str] = []
         self._task_overlay_max_lines = 12
         self._task_overlay_active = False
+        self._task_overlay_dismissed = False
         self._task_overlay_pulse_idx = 0
         self._task_overlay_pulse_timer = QTimer(self)
         self._task_overlay_pulse_timer.setInterval(300)
@@ -69,6 +72,33 @@ class GraphicsCanvas(QGraphicsView):
         self._task_overlay_widget.setGeometry(self.viewport().rect())
         self._task_overlay_widget.show()
         self._task_overlay_widget.raise_()
+        self._task_overlay_close_button = QPushButton("x", self.viewport())
+        self._task_overlay_close_button.setFixedSize(16, 16)
+        self._task_overlay_close_button.setCursor(Qt.PointingHandCursor)
+        self._task_overlay_close_button.setToolTip("Hide task log")
+        self._task_overlay_close_button.setFocusPolicy(Qt.NoFocus)
+        overlay_close_icon = icon_for("overlay_close", size=14, color="#d8f5dd")
+        if not overlay_close_icon.isNull():
+            self._task_overlay_close_button.setIcon(overlay_close_icon)
+            self._task_overlay_close_button.setIconSize(QSize(12, 12))
+            self._task_overlay_close_button.setText("")
+        self._task_overlay_close_button.setStyleSheet(
+            "QPushButton {"
+            " background-color: rgba(15, 18, 22, 190);"
+            " color: #d8f5dd;"
+            " border: 1px solid rgba(130, 220, 140, 180);"
+            " border-radius: 8px;"
+            " font: 8pt Consolas;"
+            " padding: 0px;"
+            "}"
+            "QPushButton:hover {"
+            " background-color: rgba(34, 44, 52, 220);"
+            " border: 1px solid rgba(190, 250, 190, 220);"
+            "}"
+        )
+        self._task_overlay_close_button.clicked.connect(self._dismiss_task_overlay)
+        self._task_overlay_close_button.hide()
+        self._sync_task_overlay_controls()
         self._fast_nav_enabled = True
         self._fast_nav_active = False
         self._fast_nav_snapshot: QPixmap | None = None
@@ -81,6 +111,9 @@ class GraphicsCanvas(QGraphicsView):
         self._fast_nav_idle_timer.timeout.connect(self._finish_fast_navigation)
         self._isolation_view_mode = "width"  # "width" | "centerline"
         self._cutout_view_mode = "width"  # "width" | "centerline"
+        self._drill_view_mode = "width"  # "width" | "centerline"
+        self._crosshair_enabled = True
+        self._crosshair_pos: QPoint | None = None
 
     def set_grid_visible(self, visible: bool) -> None:
         self._show_grid = bool(visible)
@@ -131,6 +164,19 @@ class GraphicsCanvas(QGraphicsView):
     def cutout_view_mode(self) -> str:
         return self._cutout_view_mode
 
+    def set_drill_view_mode(self, mode: str) -> None:
+        normalized = (mode or "").strip().lower()
+        if normalized not in {"width", "centerline"}:
+            normalized = "width"
+        self._drill_view_mode = normalized
+        for item in self.scene().items():
+            if isinstance(item, CAMLayerItem):
+                item.set_drill_view_mode(normalized)
+        self.viewport().update()
+
+    def drill_view_mode(self) -> str:
+        return self._drill_view_mode
+
     def clear_scene(self) -> None:
         self._finish_fast_navigation()
         self.scene().clear()
@@ -147,10 +193,19 @@ class GraphicsCanvas(QGraphicsView):
             layer_index=layer_index,
             isolation_view_mode=self._isolation_view_mode,
             cutout_view_mode=self._cutout_view_mode,
+            drill_view_mode=self._drill_view_mode,
         )
-        item.setOpacity(layer.opacity)
+        item.setOpacity(1.0)
         self.scene().addItem(item)
         return item
+
+    def remove_layer(self, handle) -> None:  # noqa: ANN001
+        if handle is None:
+            return
+        try:
+            self.scene().removeItem(handle)
+        except Exception:
+            return
 
     def fit_scene(self) -> None:
         self._finish_fast_navigation()
@@ -236,6 +291,7 @@ class GraphicsCanvas(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:  # noqa: N802
+        self._crosshair_pos = event.pos()
         if self._panning:
             delta = event.pos() - self._last_pan_point
             self._last_pan_point = event.pos()
@@ -260,6 +316,11 @@ class GraphicsCanvas(QGraphicsView):
         scene_pos = self.mapToScene(event.pos())
         self.cursor_moved.emit(scene_pos.x(), scene_pos.y())
         super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802, ANN001
+        self._crosshair_pos = None
+        self.viewport().update()
+        super().leaveEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802
         if event.key() == Qt.Key_Space:
@@ -315,8 +376,9 @@ class GraphicsCanvas(QGraphicsView):
                     self._draw_rulers_overlay(painter)
             finally:
                 painter.end()
-            self._task_overlay_widget.raise_()
-            self._task_overlay_widget.update()
+            self._sync_task_overlay_controls()
+            if not self._task_overlay_dismissed:
+                self._task_overlay_widget.update()
             return
 
         super().paintEvent(event)
@@ -337,14 +399,20 @@ class GraphicsCanvas(QGraphicsView):
                 self._draw_rulers_overlay(painter)
             finally:
                 painter.end()
-        self._task_overlay_widget.raise_()
-        self._task_overlay_widget.update()
+        if self._crosshair_enabled and self._crosshair_pos is not None:
+            painter = QPainter(self.viewport())
+            try:
+                self._draw_crosshair_overlay(painter, self._crosshair_pos)
+            finally:
+                painter.end()
+        self._sync_task_overlay_controls()
+        if not self._task_overlay_dismissed:
+            self._task_overlay_widget.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802, ANN001
         super().resizeEvent(event)
         self._finish_fast_navigation()
-        self._task_overlay_widget.setGeometry(self.viewport().rect())
-        self._task_overlay_widget.raise_()
+        self._sync_task_overlay_controls()
 
     def inspect_at(
         self,
@@ -366,6 +434,79 @@ class GraphicsCanvas(QGraphicsView):
                 if layer_index == preferred_layer_index:
                     return layer_index, info
         return hits[0]
+
+    def debug_dump_at(
+        self,
+        x_mm: float,
+        y_mm: float,
+        preferred_layer_index: int | None = None,
+    ) -> str:
+        scene_pos = QPointF(float(x_mm), float(y_mm))
+        lines = [
+            f"[{self._stamp()}] geometry-debug renderer=qt",
+            f"click_mm=({float(x_mm):.6f},{float(y_mm):.6f})",
+        ]
+        hits: list[tuple[CAMLayerItem, dict[str, str]]] = []
+        for item in self.scene().items(scene_pos):
+            if isinstance(item, CAMLayerItem):
+                info = item.inspect_at(scene_pos)
+                if info is not None:
+                    hits.append((item, info))
+        if not hits:
+            lines.append("hit=none")
+            return "\n".join(lines)
+
+        hit_item, hit_info = hits[0]
+        if preferred_layer_index is not None:
+            for item, info in hits:
+                if item.layer_index == preferred_layer_index:
+                    hit_item, hit_info = item, info
+                    break
+
+        gid = str(hit_info.get("group_id", "")).strip()
+        primitive_index = str(hit_info.get("primitive_index", "")).strip()
+        scoped: list[DrawShape] = []
+        for shape in hit_item._shapes:
+            sinfo = shape.info or {}
+            if gid and str(sinfo.get("group_id", "")).strip() == gid:
+                scoped.append(shape)
+            elif not gid and primitive_index and str(sinfo.get("primitive_index", "")).strip() == primitive_index:
+                scoped.append(shape)
+        if not scoped:
+            scoped = list(hit_item._shapes)
+
+        clear_count = sum(1 for s in scoped if bool(s.clear))
+        dark_count = len(scoped) - clear_count
+        kind_ctr = Counter(str(s.kind) for s in scoped)
+        prim_ctr = Counter(str((s.info or {}).get("primitive_type", "")) for s in scoped)
+
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        for s in scoped:
+            rect = s.path.boundingRect()
+            min_x = min(min_x, float(rect.left()))
+            min_y = min(min_y, float(rect.top()))
+            max_x = max(max_x, float(rect.right()))
+            max_y = max(max_y, float(rect.bottom()))
+
+        lines.extend(
+            [
+                f"hit_layer_index={hit_item.layer_index}",
+                f"group_id={gid or '(none)'}",
+                f"primitive_index={primitive_index or '(none)'}",
+                f"scoped_shape_count={len(scoped)}",
+                f"scoped_dark_shapes={dark_count}",
+                f"scoped_clear_shapes={clear_count}",
+                f"scoped_kind_counts={dict(kind_ctr)}",
+                f"scoped_primitive_type_counts={dict(prim_ctr)}",
+            ]
+        )
+        if min_x != float("inf"):
+            lines.append(f"scoped_bounds_mm=({min_x:.6f},{min_y:.6f})-({max_x:.6f},{max_y:.6f})")
+        lines.append(f"hit_info={{{', '.join(f'{k}={v}' for k, v in sorted(hit_info.items()))}}}")
+        return "\n".join(lines)
 
     def _wants_pan(self, event: QMouseEvent) -> bool:
         if event.button() in (Qt.MiddleButton, Qt.RightButton):
@@ -515,6 +656,17 @@ class GraphicsCanvas(QGraphicsView):
         painter.setPen(QColor("#f3f6fb"))
         painter.drawText(5, 15, "mm")
 
+    def _draw_crosshair_overlay(self, painter: QPainter, view_pos: QPoint) -> None:
+        view_rect = self.viewport().rect()
+        if not view_rect.contains(view_pos):
+            return
+        pen = QPen(QColor(220, 232, 246, 165))
+        pen.setCosmetic(True)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.drawLine(view_rect.left(), view_pos.y(), view_rect.right(), view_pos.y())
+        painter.drawLine(view_pos.x(), view_rect.top(), view_pos.x(), view_rect.bottom())
+
     def _format_mm_label(self, value_mm: float) -> str:
         rounded = float(value_mm)
         if abs(rounded) < 1e-9:
@@ -646,6 +798,7 @@ class GraphicsCanvas(QGraphicsView):
     def start_task_overlay(self, title: str) -> None:
         self._task_overlay_lines.clear()
         self._task_overlay_active = True
+        self._task_overlay_dismissed = False
         self._task_overlay_pulse_idx = 0
         self._task_overlay_pulse_timer.start()
         self.append_task_overlay_line(f"[{self._stamp()}] task start: {title}")
@@ -657,7 +810,9 @@ class GraphicsCanvas(QGraphicsView):
         self._task_overlay_lines.append(text)
         if len(self._task_overlay_lines) > self._task_overlay_max_lines:
             self._task_overlay_lines = self._task_overlay_lines[-self._task_overlay_max_lines :]
-        self._task_overlay_widget.update()
+        self._sync_task_overlay_controls()
+        if not self._task_overlay_dismissed:
+            self._task_overlay_widget.update()
 
     def finish_task_overlay(self, *, success: bool, detail: str = "") -> None:
         self._task_overlay_pulse_timer.stop()
@@ -667,7 +822,7 @@ class GraphicsCanvas(QGraphicsView):
         self.append_task_overlay_line(f"[{self._stamp()}] task {status}{tail}")
 
     def _task_overlay_pulse(self) -> None:
-        if not self._task_overlay_active:
+        if not self._task_overlay_active or self._task_overlay_dismissed:
             return
         frames = ("-", "\\", "|", "/")
         msgs = (
@@ -682,7 +837,7 @@ class GraphicsCanvas(QGraphicsView):
         self.append_task_overlay_line(f"[{self._stamp()}] {frame} {msg}")
 
     def _draw_task_overlay(self, painter: QPainter, overlay_rect: QRect) -> None:
-        if not self._task_overlay_lines:
+        if self._task_overlay_dismissed or not self._task_overlay_lines:
             return
         painter.setRenderHint(QPainter.TextAntialiasing, True)
         font = QFont("Consolas")
@@ -706,6 +861,29 @@ class GraphicsCanvas(QGraphicsView):
             painter.setPen(QColor(185, 247, 192, alpha))
             painter.drawText(panel_x + 2, y, line)
             y -= line_h
+
+    def _sync_task_overlay_controls(self) -> None:
+        self._task_overlay_widget.setGeometry(self.viewport().rect())
+        if self._task_overlay_dismissed or not self._task_overlay_lines:
+            self._task_overlay_widget.hide()
+            self._task_overlay_close_button.hide()
+            return
+        self._task_overlay_widget.show()
+        self._task_overlay_widget.raise_()
+        line_h = 14
+        pad_x = 10
+        pad_y = 10
+        panel_h = (line_h * max(1, len(self._task_overlay_lines))) + 4
+        panel_y = max(pad_y, self.viewport().height() - panel_h - pad_y)
+        btn_x = pad_x
+        btn_y = max(2, panel_y - self._task_overlay_close_button.height() - 2)
+        self._task_overlay_close_button.move(btn_x, btn_y)
+        self._task_overlay_close_button.show()
+        self._task_overlay_close_button.raise_()
+
+    def _dismiss_task_overlay(self) -> None:
+        self._task_overlay_dismissed = True
+        self._sync_task_overlay_controls()
 
     @staticmethod
     def _stamp() -> str:
@@ -802,12 +980,14 @@ class CAMLayerItem(QGraphicsItem):
         layer_index: int,
         isolation_view_mode: str = "width",
         cutout_view_mode: str = "width",
+        drill_view_mode: str = "width",
     ) -> None:
         super().__init__()
         self.layer = layer
         self.layer_index = layer_index
         self._isolation_view_mode = isolation_view_mode
         self._cutout_view_mode = cutout_view_mode
+        self._drill_view_mode = drill_view_mode
         geometry = build_layer_geometry(layer)
         self._shapes: list[DrawShape] = geometry.shapes
         self._rect = geometry.bounds
@@ -833,6 +1013,10 @@ class CAMLayerItem(QGraphicsItem):
         self._cutout_view_mode = mode
         self.update()
 
+    def set_drill_view_mode(self, mode: str) -> None:
+        self._drill_view_mode = mode
+        self.update()
+
     def boundingRect(self) -> QRectF:  # noqa: N802
         return self._rect
 
@@ -844,6 +1028,15 @@ class CAMLayerItem(QGraphicsItem):
         kind = self.layer.metadata.get("kind", "").strip().lower()
         is_isolation = kind == "isolation"
         is_cutout = kind == "cutout_toolpath"
+        is_drill = kind == "drill_toolpath"
+        is_toolpath = is_isolation or is_cutout or is_drill
+        toolpath_mode = (
+            self._isolation_view_mode
+            if is_isolation
+            else self._cutout_view_mode
+            if is_cutout
+            else self._drill_view_mode
+        )
         for shape in self._shapes:
             if shape.kind == "line":
                 if shape.clear:
@@ -857,9 +1050,8 @@ class CAMLayerItem(QGraphicsItem):
                     painter.drawPath(shape.path)
                     painter.restore()
                 else:
-                    if is_isolation or is_cutout:
-                        mode = self._isolation_view_mode if is_isolation else self._cutout_view_mode
-                        if mode == "centerline":
+                    if is_toolpath:
+                        if toolpath_mode == "centerline":
                             center_pen = QPen(color)
                             center_pen.setWidthF(max(0.02, shape.line_width * 0.22))
                             center_pen.setJoinStyle(Qt.RoundJoin)
@@ -890,6 +1082,8 @@ class CAMLayerItem(QGraphicsItem):
 
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
+            if is_toolpath and toolpath_mode == "centerline":
+                continue
             if shape.clear:
                 painter.save()
                 painter.setCompositionMode(QPainter.CompositionMode_Clear)
@@ -902,11 +1096,17 @@ class CAMLayerItem(QGraphicsItem):
         local_pos = self.mapFromScene(scene_pos)
         for idx in range(len(self._shapes) - 1, -1, -1):
             shape = self._shapes[idx]
+            rect = shape.path.boundingRect()
             if shape.kind == "fill":
                 if shape.path.contains(local_pos):
                     info = dict(shape.info)
                     info["shape_kind"] = shape.kind
                     info["shape_index"] = str(idx)
+                    # Bounds fallback is used by metadata panel for pad-dimension summary.
+                    if "bounds_width_mm" not in info:
+                        info["bounds_width_mm"] = f"{max(0.0, float(rect.width())):.6f}"
+                    if "bounds_height_mm" not in info:
+                        info["bounds_height_mm"] = f"{max(0.0, float(rect.height())):.6f}"
                     return info
             else:
                 stroker = QPainterPathStroker()
@@ -917,6 +1117,10 @@ class CAMLayerItem(QGraphicsItem):
                     info["shape_kind"] = shape.kind
                     info["shape_index"] = str(idx)
                     info["line_width"] = f"{shape.line_width:.6f}"
+                    if "bounds_width_mm" not in info:
+                        info["bounds_width_mm"] = f"{max(0.0, float(rect.width())):.6f}"
+                    if "bounds_height_mm" not in info:
+                        info["bounds_height_mm"] = f"{max(0.0, float(rect.height())):.6f}"
                     return info
         return None
 

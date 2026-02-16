@@ -138,6 +138,7 @@ Import/render failures are surfaced with Qt error dialogs and logs.
 ## Developer Docs
 
 - `docs/ARCHITECTURE.md`
+- `docs/PROCESS_WORKFLOWS.md`
 - `docs/RENDERING.md`
 - `docs/DEBUGGING.md`
 - `docs/REGRESSION_PACK.md`

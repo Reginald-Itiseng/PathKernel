@@ -8,6 +8,7 @@ import math
 from shapely import affinity
 from shapely.ops import linemerge, unary_union
 
+from app.core.cnc_params import calculate_coppercam_params
 from app.core.io import Line
 from app.core.project import Layer, Project
 
@@ -19,6 +20,19 @@ class IsolationParams:
     overlap: float = 0.0
     iso_type: int = 2  # 0=exterior, 1=interior, 2=both
     extra_pad_contours: int = 0
+    # Optional dynamic V-bit geometry inputs.
+    tool_profile: str = "cylindrical/flute"
+    tool_tip_diameter_mm: float = 0.0
+    tool_angle_deg: float = 0.0
+    cutting_depth_mm: float = 0.0
+    # Extra offset added beyond the effective tool radius for the first pass.
+    trace_margin_mm: float = 0.0
+    # Optional explicit hatching step-over (mm). If <= 0, derived automatically.
+    hatching_margin_mm: float = 0.0
+    # Shapely buffer join style: 1=round, 2=mitre, 3=bevel.
+    buffer_join_style: int = 1
+    # When true, passes wider than minimum measured copper gap are skipped.
+    skip_tight_clearance_paths: bool = False
 
 
 @dataclass(slots=True)
@@ -38,16 +52,53 @@ def build_isolation_layer(
     copper = _build_copper_geometry(source_layer)
     if copper is None or copper.is_empty:
         raise ValueError("Could not derive copper geometry from this layer.")
-
-    step = params.tool_diameter_mm * max(0.01, 1.0 - max(0.0, min(0.999, params.overlap)))
-    offset_start = params.tool_diameter_mm * 0.5
+    join_style = _normalized_join_style(getattr(params, "buffer_join_style", 1))
+    tool = _derive_isolation_tool_geometry(params)
+    effective_radius = float(tool["effective_radius_mm"])
+    effective_diameter = float(tool["effective_diameter_mm"])
+    step = float(tool["hatching_margin_mm"])
+    offset_start = float(tool["trace_compensation_mm"])
     passes = max(1, int(params.passes))
+    _log(
+        log,
+        (
+            "isolation: tool "
+            f"profile={tool['profile']} "
+            f"nominal={tool['nominal_diameter_mm']:.4f}mm "
+            f"effective={effective_diameter:.4f}mm "
+            f"radius={effective_radius:.4f}mm "
+            f"trace_margin={tool['trace_margin_mm']:.4f}mm "
+            f"hatch_step={step:.4f}mm"
+        ),
+    )
+
+    min_gap = _minimum_copper_gap(copper)
+    clearance_warning = ""
+    if min_gap is not None and effective_diameter > (min_gap + 1e-9):
+        clearance_warning = (
+            "effective tool width exceeds minimum copper gap: "
+            f"D_eff={effective_diameter:.4f}mm > gap={min_gap:.4f}mm"
+        )
+        _log(log, f"isolation: warning: {clearance_warning}")
 
     iso_shapes = []
     for i in range(passes):
         offset = offset_start + (i * step)
+        if (
+            bool(getattr(params, "skip_tight_clearance_paths", False))
+            and min_gap is not None
+            and (2.0 * offset) > (min_gap + 1e-9)
+        ):
+            _log(
+                log,
+                (
+                    "isolation: skipping pass due to tight clearance "
+                    f"(offset={offset:.4f}mm, min_gap={min_gap:.4f}mm)"
+                ),
+            )
+            continue
         _log(log, f"isolation: pass {i + 1}/{passes} at offset {offset:.4f} mm")
-        geo = _isolation_geometry(copper, offset=offset, iso_type=params.iso_type)
+        geo = _isolation_geometry(copper, offset=offset, iso_type=params.iso_type, join_style=join_style)
         if geo is not None and not geo.is_empty:
             iso_shapes.append(_clean_linework(geo))
 
@@ -59,19 +110,33 @@ def build_isolation_layer(
         if pad_shapes:
             pads_union = unary_union(pad_shapes)
             non_pad_union = unary_union(non_pad_shapes) if non_pad_shapes else None
-            tool_radius = max(0.001, params.tool_diameter_mm * 0.5)
+            tool_radius = max(0.001, effective_radius)
             existing_paths = unary_union([g for g in iso_shapes if g is not None and not g.is_empty]) if iso_shapes else None
-            existing_swept = _linework_swept_area(existing_paths, tool_radius) if existing_paths is not None else None
+            existing_swept = (
+                _linework_swept_area(existing_paths, tool_radius, join_style=join_style)
+                if existing_paths is not None
+                else None
+            )
             start = offset_start + (passes * step)
             for i in range(extra_pad_contours):
                 offset = start + (i * step)
                 _log(log, f"isolation: extra pad contour {i + 1}/{extra_pad_contours}")
-                geo = _isolation_geometry(pads_union, offset=offset, iso_type=0)
+                geo = _isolation_geometry(pads_union, offset=offset, iso_type=0, join_style=join_style)
                 if geo is not None and not geo.is_empty:
                     candidate = _clean_linework(geo)
                     # Buffered keepout from previous toolpaths; prevents recutting into prior contours.
                     if existing_swept is not None and not existing_swept.is_empty:
-                        candidate = candidate.difference(existing_swept)
+                        keepout = existing_swept
+                        # Prevent boundary-touch clipping (dotted/missing sections) when contour spacing
+                        # is near the keepout radius due to floating-point tolerance.
+                        shrink = max(0.0001, tool_radius * 0.02)
+                        try:
+                            shrunk = existing_swept.buffer(-shrink, join_style=join_style)
+                            if shrunk is not None and not shrunk.is_empty:
+                                keepout = shrunk
+                        except Exception:
+                            pass
+                        candidate = candidate.difference(keepout)
                     # Keep extra pad contours clear of other copper features.
                     if non_pad_union is not None and not non_pad_union.is_empty:
                         candidate = candidate.difference(non_pad_union.buffer(max(0.001, tool_radius * 0.22)))
@@ -79,7 +144,7 @@ def build_isolation_layer(
                     if candidate is not None and not candidate.is_empty:
                         iso_shapes.append(candidate)
                         existing_paths = candidate if existing_paths is None else unary_union([existing_paths, candidate])
-                        new_swept = _linework_swept_area(candidate, tool_radius)
+                        new_swept = _linework_swept_area(candidate, tool_radius, join_style=join_style)
                         if new_swept is not None and not new_swept.is_empty:
                             existing_swept = (
                                 new_swept
@@ -92,7 +157,7 @@ def build_isolation_layer(
 
     merged = unary_union(iso_shapes)
     _log(log, "isolation: converting linework to toolpath primitives")
-    primitives = _as_line_primitives(merged, params.tool_diameter_mm)
+    primitives = _as_line_primitives(merged, effective_diameter)
     bounds = _bounds_tuple(merged.bounds if hasattr(merged, "bounds") else None)
     meta = {
         "name": f"{source_layer.name}_iso",
@@ -101,12 +166,26 @@ def build_isolation_layer(
         "units": "mm",
         "derived_from": source_layer.name,
         "source_kind": source_layer.kind,
-        "isolation_tool_diameter_mm": f"{params.tool_diameter_mm:.6f}",
+        "isolation_tool_diameter_mm": f"{effective_diameter:.6f}",
+        "isolation_nominal_tool_diameter_mm": f"{tool['nominal_diameter_mm']:.6f}",
+        "isolation_effective_radius_mm": f"{effective_radius:.6f}",
+        "isolation_hatching_margin_mm": f"{step:.6f}",
+        "isolation_trace_compensation_mm": f"{offset_start:.6f}",
+        "isolation_tool_profile": str(tool["profile"]),
+        "isolation_tool_tip_diameter_mm": f"{tool['tip_diameter_mm']:.6f}",
+        "isolation_tool_angle_deg": f"{tool['angle_deg']:.6f}",
+        "isolation_cutting_depth_mm": f"{tool['cutting_depth_mm']:.6f}",
+        "isolation_trace_margin_mm": f"{tool['trace_margin_mm']:.6f}",
+        "isolation_buffer_join_style": str(join_style),
         "isolation_passes": str(passes),
         "isolation_overlap": f"{params.overlap:.3f}",
         "isolation_type": _iso_type_label(params.iso_type),
         "extra_pad_contours": str(extra_pad_contours),
     }
+    if min_gap is not None:
+        meta["minimum_copper_gap_mm"] = f"{min_gap:.6f}"
+    if clearance_warning:
+        meta["tool_clearance_warning"] = clearance_warning
     derived = _DerivedSource(units="mm", primitives=primitives, bounds=bounds)
     return Layer(
         name=f"{source_layer.name}_iso",
@@ -130,12 +209,68 @@ def _log(log: callable | None, msg: str) -> None:
         pass
 
 
-def _isolation_geometry(copper, *, offset: float, iso_type: int):
+def _derive_isolation_tool_geometry(params: IsolationParams) -> dict[str, float | str]:
+    nominal_diameter = max(0.001, float(getattr(params, "tool_diameter_mm", 0.0) or 0.0))
+    profile = str(getattr(params, "tool_profile", "cylindrical/flute") or "").strip().lower()
+    tip_dia = float(getattr(params, "tool_tip_diameter_mm", 0.0) or 0.0)
+    angle_deg = max(0.0, float(getattr(params, "tool_angle_deg", 0.0) or 0.0))
+    cut_depth = max(0.0, float(getattr(params, "cutting_depth_mm", 0.0) or 0.0))
+    trace_margin = max(0.0, float(getattr(params, "trace_margin_mm", 0.0) or 0.0))
+    overlap = max(0.0, min(0.999, float(getattr(params, "overlap", 0.0) or 0.0)))
+    explicit_margin = max(0.0, float(getattr(params, "hatching_margin_mm", 0.0) or 0.0))
+
+    if profile == "conical" or (angle_deg > 0.0 and cut_depth > 0.0):
+        tip = tip_dia if tip_dia > 0.0 else nominal_diameter
+        calc = calculate_coppercam_params(T_dia=tip, T_angle=angle_deg, D_cut=cut_depth)
+        effective_radius = max(0.001, float(calc["effective_radius"]))
+        effective_diameter = max(0.002, float(calc["total_path_width"]))
+        auto_margin = max(0.001, float(calc["hatching_margin"]))
+        margin = explicit_margin if explicit_margin > 0.0 else auto_margin
+        return {
+            "profile": "conical",
+            "nominal_diameter_mm": nominal_diameter,
+            "tip_diameter_mm": tip,
+            "angle_deg": angle_deg,
+            "cutting_depth_mm": cut_depth,
+            "trace_margin_mm": trace_margin,
+            "effective_radius_mm": effective_radius,
+            "effective_diameter_mm": effective_diameter,
+            "hatching_margin_mm": max(0.001, margin),
+            "trace_compensation_mm": max(0.001, effective_radius + trace_margin),
+        }
+
+    effective_diameter = nominal_diameter
+    effective_radius = max(0.001, effective_diameter * 0.5)
+    auto_margin = effective_diameter * max(0.01, 1.0 - overlap)
+    margin = explicit_margin if explicit_margin > 0.0 else auto_margin
+    return {
+        "profile": "cylindrical/flute",
+        "nominal_diameter_mm": nominal_diameter,
+        "tip_diameter_mm": nominal_diameter,
+        "angle_deg": 0.0,
+        "cutting_depth_mm": 0.0,
+        "trace_margin_mm": trace_margin,
+        "effective_radius_mm": effective_radius,
+        "effective_diameter_mm": max(0.002, effective_diameter),
+        "hatching_margin_mm": max(0.001, margin),
+        "trace_compensation_mm": effective_radius + trace_margin,
+    }
+
+
+def _normalized_join_style(value: Any) -> int:
+    try:
+        out = int(value)
+    except Exception:
+        return 1
+    return out if out in {1, 2, 3} else 1
+
+
+def _isolation_geometry(copper, *, offset: float, iso_type: int, join_style: int = 1):
     if offset <= 0.0:
         return None
 
-    ext = copper.buffer(offset).boundary if iso_type in (0, 2) else None
-    inn = copper.buffer(-offset).boundary if iso_type in (1, 2) else None
+    ext = copper.buffer(offset, join_style=join_style).boundary if iso_type in (0, 2) else None
+    inn = copper.buffer(-offset, join_style=join_style).boundary if iso_type in (1, 2) else None
 
     if ext is not None and inn is not None:
         from shapely.ops import unary_union
@@ -235,11 +370,11 @@ def _clean_linework(geom):
     return geom
 
 
-def _linework_swept_area(geom, tool_radius: float):
+def _linework_swept_area(geom, tool_radius: float, join_style: int = 1):
     if geom is None or geom.is_empty:
         return None
     try:
-        swept = geom.buffer(tool_radius)
+        swept = geom.buffer(tool_radius, join_style=join_style)
         return swept if swept is not None and not swept.is_empty else None
     except Exception:
         return None
@@ -488,6 +623,64 @@ def _iter_lines(geom):
         return
     for sub in getattr(geom, "geoms", []):
         yield from _iter_lines(sub)
+
+
+def _minimum_copper_gap(copper) -> float | None:
+    parts = _polygon_parts(copper)
+    if len(parts) < 2:
+        return None
+
+    # Keep runtime bounded on extremely fragmented geometry.
+    if len(parts) > 1200:
+        return None
+
+    min_gap = float("inf")
+    checks = 0
+    max_checks = 250_000
+    bounds = [p.bounds for p in parts]
+
+    for i in range(len(parts) - 1):
+        b0 = bounds[i]
+        for j in range(i + 1, len(parts)):
+            checks += 1
+            if checks > max_checks:
+                return None if not math.isfinite(min_gap) else min_gap
+            b1 = bounds[j]
+            lower = _bounds_distance_lower_bound(b0, b1)
+            if lower >= min_gap:
+                continue
+            d = float(parts[i].distance(parts[j]))
+            if d < min_gap:
+                min_gap = d
+                if min_gap <= 0.0:
+                    return 0.0
+
+    return None if not math.isfinite(min_gap) else min_gap
+
+
+def _polygon_parts(geom) -> list[Any]:
+    if geom is None or geom.is_empty:
+        return []
+    gt = geom.geom_type
+    if gt == "Polygon":
+        return [geom]
+    out: list[Any] = []
+    for g in getattr(geom, "geoms", []) or []:
+        out.extend(_polygon_parts(g))
+    return out
+
+
+def _bounds_distance_lower_bound(
+    b0: tuple[float, float, float, float],
+    b1: tuple[float, float, float, float],
+) -> float:
+    a_minx, a_miny, a_maxx, a_maxy = b0
+    b_minx, b_miny, b_maxx, b_maxy = b1
+    dx = max(0.0, b_minx - a_maxx, a_minx - b_maxx)
+    dy = max(0.0, b_miny - a_maxy, a_miny - b_maxy)
+    if dx <= 0.0 and dy <= 0.0:
+        return 0.0
+    return math.hypot(dx, dy)
 
 
 def _vertices(value: Any) -> list[tuple[float, float]]:

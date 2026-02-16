@@ -35,11 +35,11 @@ EXCELLON_EXTENSIONS = {
 }
 
 ROLE_DEFAULT_STYLE = {
-    # KiCad-like copper colors with reduced opacity for overlap visibility.
-    "top": ("#C83434", 0.78),
-    "bottom": ("#4D7FC4", 0.78),
-    "holes": ("#D8A33D", 0.95),
-    "cutout": ("#B8C0CC", 0.95),
+    # KiCad-like copper colors rendered fully opaque.
+    "top": ("#C83434", 1.0),
+    "bottom": ("#4D7FC4", 1.0),
+    "holes": ("#D8A33D", 1.0),
+    "cutout": ("#B8C0CC", 1.0),
 }
 
 
@@ -133,6 +133,22 @@ class Polygon:
     vertices: list[tuple[float, float]]
     flashed: bool = True
     level_polarity: str = "dark"
+
+
+@dataclass(slots=True)
+class AMGroup:
+    primitives: list[Any]
+    level_polarity: str = "dark"
+    flashed: bool = True
+    group_id: str = ""
+
+
+@dataclass(slots=True)
+class Region:
+    primitives: list[Any]
+    level_polarity: str = "dark"
+    flashed: bool = True
+    group_id: str = ""
 
 
 @dataclass(slots=True)
@@ -281,8 +297,12 @@ def _adapt_gerbonara_cam(cam: Any, *, kind: str = "gerber") -> _CompatSource:
     max_x = float("-inf")
     max_y = float("-inf")
 
-    for obj in objects:
-        adapted = _adapt_gerbonara_object(obj, kind=kind)
+    for obj_idx, obj in enumerate(objects):
+        adapted = _adapt_gerbonara_object(
+            obj,
+            kind=kind,
+            group_hint=f"obj_{obj_idx}",
+        )
         if adapted is None:
             continue
         items = adapted if isinstance(adapted, list) else [adapted]
@@ -305,7 +325,12 @@ def _adapt_gerbonara_cam(cam: Any, *, kind: str = "gerber") -> _CompatSource:
     return _CompatSource(units=units, primitives=primitives, bounds=bounds)
 
 
-def _adapt_gerbonara_object(obj: Any, *, kind: str = "gerber") -> Any | list[Any] | None:
+def _adapt_gerbonara_object(
+    obj: Any,
+    *,
+    kind: str = "gerber",
+    group_hint: str = "",
+) -> Any | list[Any] | None:
     cls_name = obj.__class__.__name__.lower()
     polarity = _gerbonara_polarity(obj)
 
@@ -319,7 +344,22 @@ def _adapt_gerbonara_object(obj: Any, *, kind: str = "gerber") -> Any | list[Any
             if len(verts) >= 3:
                 if abs(verts[0][0] - verts[-1][0]) > 1e-9 or abs(verts[0][1] - verts[-1][1]) > 1e-9:
                     verts.append(verts[0])
-                return Polygon(vertices=verts, flashed=True, level_polarity=polarity)
+                segs: list[Any] = []
+                for i in range(len(verts) - 1):
+                    segs.append(
+                        Line(
+                            start=(verts[i][0], verts[i][1]),
+                            end=(verts[i + 1][0], verts[i + 1][1]),
+                            diameter=0.0,
+                            level_polarity=polarity,
+                        )
+                    )
+                return Region(
+                    primitives=segs,
+                    level_polarity=polarity,
+                    flashed=True,
+                    group_id=f"region:{group_hint}",
+                )
         except Exception:
             return None
 
@@ -379,7 +419,14 @@ def _adapt_gerbonara_object(obj: Any, *, kind: str = "gerber") -> Any | list[Any
                         out.append(ap)
                 if out:
                     collapsed = _collapse_simple_macro_primitives(out, flash_pos=pos, polarity=polarity)
-                    return collapsed if collapsed is not None else out
+                    if collapsed is not None:
+                        return collapsed
+                    return AMGroup(
+                        primitives=out,
+                        level_polarity=polarity,
+                        flashed=True,
+                        group_id=f"am:{group_hint}",
+                    )
             except Exception:
                 pass
         if "rectangle" in apt_name and hasattr(aperture, "w") and hasattr(aperture, "h"):
@@ -683,6 +730,19 @@ def _gerbonara_polarity(obj: Any) -> str:
 
 
 def _primitive_bbox(primitive: Any) -> tuple[float, float, float, float] | None:
+    if hasattr(primitive, "primitives"):
+        try:
+            items = list(getattr(primitive, "primitives") or [])
+            boxes = [_primitive_bbox(p) for p in items]
+            boxes = [b for b in boxes if b is not None]
+            if boxes:
+                min_x = min(b[0] for b in boxes)
+                min_y = min(b[1] for b in boxes)
+                max_x = max(b[2] for b in boxes)
+                max_y = max(b[3] for b in boxes)
+                return (min_x, min_y, max_x, max_y)
+        except Exception:
+            pass
     if hasattr(primitive, "vertices"):
         try:
             verts = list(getattr(primitive, "vertices") or [])

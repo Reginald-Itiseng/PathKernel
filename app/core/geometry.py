@@ -12,7 +12,7 @@ import math
 from typing import Any
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QPainterPath
+from PySide6.QtGui import QPainterPath, QPainterPathStroker
 
 from app.core.project import Layer, ManualEdit
 
@@ -198,16 +198,20 @@ def _append_primitive_shapes(
     primitive_index: int = -1,
     override: dict[str, float | str] | None = None,
     layer_kind: str = "gerber",
+    group_id: str | None = None,
 ) -> bool:
     override = override or {}
     cls_name = primitive.__class__.__name__.lower()
     clear = str(getattr(primitive, "level_polarity", "dark")).lower() == "clear"
+    resolved_group = group_id or str(getattr(primitive, "group_id", "")).strip() or f"primitive:{primitive_index}"
     info = {
-        "primitive_type": primitive.__class__.__name__,
+        "primitive_type": _primitive_type_label(primitive),
         "primitive_index": str(primitive_index),
+        "group_id": resolved_group,
         "level_polarity": str(getattr(primitive, "level_polarity", "dark")),
         "flashed": str(bool(getattr(primitive, "flashed", False))),
     }
+    _inject_primitive_dimension_info(info, primitive, override)
 
     if cls_name == "region":
         sub_primitives = getattr(primitive, "primitives", [])
@@ -219,14 +223,6 @@ def _append_primitive_shapes(
 
     if cls_name == "amgroup":
         sub_primitives = getattr(primitive, "primitives", [])
-        outline_primitives = [sub for sub in sub_primitives if sub.__class__.__name__.lower() == "outline"]
-        if outline_primitives:
-            keep_clear = [
-                sub
-                for sub in sub_primitives
-                if str(getattr(sub, "level_polarity", "dark")).lower() == "clear"
-            ]
-            sub_primitives = outline_primitives + keep_clear
         appended = False
         tmp_shapes: list[DrawShape] = []
         for sub in sub_primitives:
@@ -236,6 +232,7 @@ def _append_primitive_shapes(
                 unsupported,
                 primitive_index=primitive_index,
                 layer_kind=layer_kind,
+                group_id=resolved_group,
             ):
                 appended = True
             else:
@@ -245,24 +242,68 @@ def _append_primitive_shapes(
         if not appended:
             return False
 
+        # For dark AMGroups, preserve component fills/strokes and defer boolean composition to renderer.
+        # This avoids unstable early-path unions that can clip compound pads.
+        if not clear:
+            for shape in tmp_shapes:
+                if shape.kind == "fill":
+                    p = QPainterPath(shape.path)
+                    p.setFillRule(Qt.WindingFill)
+                    shapes.append(
+                        DrawShape(
+                            kind="fill",
+                            path=p,
+                            line_width=0.0,
+                            clear=shape.clear,
+                            info=dict(shape.info) if shape.info else dict(info),
+                        )
+                    )
+                    continue
+                stroker = QPainterPathStroker()
+                stroker.setWidth(max(shape.line_width, 0.02))
+                stroker.setJoinStyle(Qt.RoundJoin)
+                stroker.setCapStyle(Qt.RoundCap)
+                stroke_area = stroker.createStroke(shape.path)
+                if stroke_area.isEmpty():
+                    continue
+                stroke_area.setFillRule(Qt.WindingFill)
+                shapes.append(
+                    DrawShape(
+                        kind="fill",
+                        path=stroke_area,
+                        line_width=0.0,
+                        clear=shape.clear,
+                        info=dict(shape.info) if shape.info else dict(info),
+                    )
+                )
+            return appended
+
+        # For clear AMGroups, build one composed clear area.
         dark_fill = QPainterPath()
+        dark_fill.setFillRule(Qt.WindingFill)
         clear_fill = QPainterPath()
-        line_shapes: list[DrawShape] = []
+        clear_fill.setFillRule(Qt.WindingFill)
         for shape in tmp_shapes:
             if shape.kind == "fill":
-                if shape.clear:
-                    clear_fill = clear_fill.united(shape.path)
-                else:
-                    dark_fill = dark_fill.united(shape.path)
+                p = QPainterPath(shape.path)
             else:
-                line_shapes.append(shape)
+                stroker = QPainterPathStroker()
+                stroker.setWidth(max(shape.line_width, 0.02))
+                stroker.setJoinStyle(Qt.RoundJoin)
+                stroker.setCapStyle(Qt.RoundCap)
+                p = stroker.createStroke(shape.path)
+            if p.isEmpty():
+                continue
+            p.setFillRule(Qt.WindingFill)
+            if shape.clear:
+                clear_fill.addPath(p)
+            else:
+                dark_fill.addPath(p)
 
-        if not dark_fill.isEmpty():
-            shapes.append(DrawShape(kind="fill", path=dark_fill, line_width=0.0, clear=clear, info=info))
-        if not clear_fill.isEmpty():
-            shapes.append(DrawShape(kind="fill", path=clear_fill, line_width=0.0, clear=True, info=info))
-        if dark_fill.isEmpty() and clear_fill.isEmpty():
-            shapes.extend(line_shapes)
+        final_clear = dark_fill.subtracted(clear_fill) if not clear_fill.isEmpty() else dark_fill
+        if not final_clear.isEmpty():
+            final_clear.setFillRule(Qt.WindingFill)
+            shapes.append(DrawShape(kind="fill", path=final_clear, line_width=0.0, clear=True, info=info))
         return appended
 
     if cls_name == "outline":
@@ -586,6 +627,79 @@ def _describe_primitive(primitive: Any) -> str:
         except Exception:
             parts.append("vertices=<err>")
     return ",".join(parts)
+
+
+def _primitive_type_label(primitive: Any) -> str:
+    cls = primitive.__class__.__name__
+    if cls.lower() == "roundrectangle":
+        try:
+            radius = float(getattr(primitive, "radius", 0.0) or 0.0)
+            if abs(radius) <= 1e-9:
+                return "Rectangle"
+        except Exception:
+            pass
+    return cls
+
+
+def _inject_primitive_dimension_info(
+    info: dict[str, str],
+    primitive: Any,
+    override: dict[str, float | str] | None,
+) -> None:
+    data = override or {}
+    _set_mm_field(info, "diameter_mm", data.get("diameter_mm", getattr(primitive, "diameter", None)), positive_only=True)
+    _set_mm_field(info, "width_mm", data.get("width_mm", getattr(primitive, "width", None)), positive_only=True)
+    _set_mm_field(info, "height_mm", data.get("height_mm", getattr(primitive, "height", None)), positive_only=True)
+    _set_mm_field(
+        info,
+        "corner_radius_mm",
+        data.get("corner_radius_mm", getattr(primitive, "radius", None)),
+        positive_only=True,
+    )
+    _set_mm_field(info, "line_width_mm", data.get("line_width_mm"), positive_only=True)
+    _set_mm_field(info, "hole_diameter_mm", data.get("hole_diameter_mm"), positive_only=True)
+
+    pos = getattr(primitive, "position", None)
+    if pos is not None:
+        try:
+            info["center_x_mm"] = f"{float(pos[0]):.6f}"
+            info["center_y_mm"] = f"{float(pos[1]):.6f}"
+        except Exception:
+            pass
+
+    vertices = getattr(primitive, "vertices", None)
+    if not vertices:
+        return
+    try:
+        pts = [(float(v[0]), float(v[1])) for v in vertices if len(v) >= 2]
+    except Exception:
+        return
+    if len(pts) < 2:
+        return
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    _set_mm_field(info, "bounds_width_mm", max(xs) - min(xs), positive_only=True)
+    _set_mm_field(info, "bounds_height_mm", max(ys) - min(ys), positive_only=True)
+
+
+def _set_mm_field(
+    info: dict[str, str],
+    key: str,
+    value: Any,
+    *,
+    positive_only: bool,
+) -> None:
+    if value is None:
+        return
+    try:
+        val = float(value)
+    except Exception:
+        return
+    if not math.isfinite(val):
+        return
+    if positive_only and val <= 0.0:
+        return
+    info[key] = f"{val:.6f}"
 
 
 def _arc_bbox_error(

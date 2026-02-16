@@ -8,13 +8,13 @@ Select a layer in the UI metadata dock and inspect:
 - `unsupported_primitives`
 - `unsupported_samples`
 
-These values are populated by `widgets._extract_shapes()`.
+These values are populated by `core.geometry.build_layer_geometry(...)`.
 
 ## Typical Issues
 
 ### Missing Geometry
 - Check `unsupported_primitives`.
-- Add handlers in `_append_primitive_shapes()` for reported classes.
+- Add handlers in `core.geometry._append_primitive_shapes()` for reported classes.
 
 ### Arc Looks Wrong
 - Verify `Arc` exists in primitive list.
@@ -31,4 +31,3 @@ These values are populated by `widgets._extract_shapes()`.
 3. Relaunch with `python -m app.main`.
 4. Re-import the same files.
 5. Capture metadata + screenshot for regression triage.
-
