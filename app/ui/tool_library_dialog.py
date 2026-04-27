@@ -1,3 +1,5 @@
+"""Tool library editor dialog for defining available cutter presets."""
+
 from __future__ import annotations
 
 from dataclasses import replace
@@ -25,6 +27,8 @@ from app.ui.icons import icon_for
 
 
 class ToolLibraryDialog(QDialog):
+    """Editor for creating and validating reusable machining tool presets."""
+
     def __init__(self, tools: list[ToolDefinition], parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Tool Library")

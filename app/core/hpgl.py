@@ -34,7 +34,14 @@ _EPS = 1e-9
 def is_toolpath_layer(layer: Layer) -> bool:
     meta = getattr(layer, "metadata", {}) or {}
     kind = str(meta.get("kind", "")).strip().lower()
-    if kind in {"isolation", "cutout_toolpath", "drill_toolpath", "toolpath"}:
+    if kind in {
+        "isolation",
+        "cutout_toolpath",
+        "drill_toolpath",
+        "surfacing_toolpath",
+        "centering_holes_toolpath",
+        "toolpath",
+    }:
         return True
     if str(meta.get("derived_from", "")).strip() and layer.kind == "geometry":
         return True
@@ -53,9 +60,12 @@ def export_layers_to_hpgl(
     toolpaths: list[dict[str, Any]] = []
     all_polylines: list[list[tuple[float, float]]] = []
     for layer in layers:
-        # Convert each layer to centerline polylines first. Width visualization stays in the UI;
-        # exporter always emits centerline motion so machine compensation is deterministic.
-        polylines = _layer_polylines(layer, chord_mm=chord_mm, stitch_tol=stitch_tol)
+        # Preserve native arcs for machine output while still sampling to polylines
+        # for stats/normalization bookkeeping.
+        strokes = _layer_strokes(layer, chord_mm=chord_mm, stitch_tol=stitch_tol)
+        if not strokes:
+            continue
+        polylines = _strokes_to_polylines(strokes, chord_mm=chord_mm)
         if not polylines:
             continue
         all_polylines.extend(polylines)
@@ -64,7 +74,7 @@ def export_layers_to_hpgl(
                 "tool_number": _layer_tool_number(layer, default=opts.pen_number),
                 "speed_mm_min": _layer_speed_mm_min(layer),
                 "rounded_speed_mm_min": _layer_rounded_speed_mm_min(layer),
-                "strokes": [{"type": "polyline", "points": poly} for poly in polylines],
+                "strokes": strokes,
             }
         )
 
@@ -316,11 +326,60 @@ def _layer_polylines(layer: Layer, *, chord_mm: float, stitch_tol: float) -> lis
     return polylines
 
 
+def _layer_strokes(layer: Layer, *, chord_mm: float, stitch_tol: float) -> list[dict[str, Any]]:
+    primitives = list(getattr(getattr(layer, "source", None), "primitives", []) or [])
+    if not primitives:
+        return []
+
+    strokes: list[dict[str, Any]] = []
+    current: list[tuple[float, float]] = []
+
+    def _flush_polyline() -> None:
+        nonlocal current
+        if len(current) >= 2:
+            strokes.append({"type": "polyline", "points": list(current)})
+        current = []
+
+    for primitive in primitives:
+        arc_stroke = _primitive_arc_stroke(layer, primitive)
+        if arc_stroke is not None:
+            _flush_polyline()
+            strokes.append(arc_stroke)
+            continue
+
+        segs = _primitive_segments(primitive, chord_mm=chord_mm)
+        for seg in segs:
+            if len(seg) < 2:
+                continue
+            transformed = [_transform_point(layer, x, y) for x, y in seg]
+            transformed = _dedupe_points(transformed)
+            if len(transformed) < 2:
+                continue
+
+            if not current:
+                current = list(transformed)
+                continue
+
+            if _points_close(current[-1], transformed[0], stitch_tol):
+                current.extend(transformed[1:])
+                continue
+            if _points_close(current[-1], transformed[-1], stitch_tol):
+                rev = list(reversed(transformed))
+                current.extend(rev[1:])
+                continue
+
+            _flush_polyline()
+            current = list(transformed)
+
+    _flush_polyline()
+    return strokes
+
+
 def _normalize_toolpaths(toolpaths: Iterable[Any], *, default_tool: int) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for entry in toolpaths:
         if isinstance(entry, Layer):
-            strokes = [{"type": "polyline", "points": poly} for poly in _layer_polylines(entry, chord_mm=0.05, stitch_tol=1e-6)]
+            strokes = _layer_strokes(entry, chord_mm=0.05, stitch_tol=1e-6)
             if not strokes:
                 continue
             out.append(
@@ -622,6 +681,96 @@ def _shift_stroke(stroke: dict[str, Any], *, shift_x: float, shift_y: float) -> 
             out["end"] = (end[0] + shift_x, end[1] + shift_y)
         if center is not None:
             out["center"] = (center[0] + shift_x, center[1] + shift_y)
+    return out
+
+
+def _primitive_arc_stroke(layer: Layer, primitive: Any) -> dict[str, Any] | None:
+    if primitive.__class__.__name__.lower() != "arc":
+        return None
+    start = _point_tuple(getattr(primitive, "start", None))
+    end = _point_tuple(getattr(primitive, "end", None))
+    center = _point_tuple(getattr(primitive, "center", None))
+    if start is None or end is None or center is None:
+        return None
+
+    t_start = _transform_point(layer, start[0], start[1])
+    t_end = _transform_point(layer, end[0], end[1])
+    t_center = _transform_point(layer, center[0], center[1])
+
+    direction = str(getattr(primitive, "direction", "counterclockwise")).strip().lower()
+    if direction not in {"clockwise", "counterclockwise"}:
+        direction = "counterclockwise"
+    # Single-axis mirror flips winding.
+    if bool(getattr(layer, "mirror_x", False)) ^ bool(getattr(layer, "mirror_y", False)):
+        direction = "clockwise" if direction == "counterclockwise" else "counterclockwise"
+
+    return {
+        "type": "arc",
+        "start": t_start,
+        "end": t_end,
+        "center": t_center,
+        "direction": direction,
+    }
+
+
+def _strokes_to_polylines(strokes: list[dict[str, Any]], *, chord_mm: float) -> list[list[tuple[float, float]]]:
+    out: list[list[tuple[float, float]]] = []
+    for stroke in strokes:
+        stype = str(stroke.get("type", "")).strip().lower()
+        if stype == "polyline":
+            points = [p for p in (_point_tuple(v) for v in list(stroke.get("points", []) or [])) if p is not None]
+            points = _dedupe_points(points)
+            if len(points) >= 2:
+                out.append(points)
+            continue
+        if stype == "line":
+            start = _point_tuple(stroke.get("start"))
+            end = _point_tuple(stroke.get("end"))
+            if start is not None and end is not None:
+                out.append([start, end])
+            continue
+        if stype == "arc":
+            pts = _arc_points_from_stroke(stroke, chord_mm=chord_mm)
+            if len(pts) >= 2:
+                out.append(pts)
+            continue
+    return out
+
+
+def _arc_points_from_stroke(stroke: dict[str, Any], *, chord_mm: float) -> list[tuple[float, float]]:
+    start = _point_tuple(stroke.get("start"))
+    end = _point_tuple(stroke.get("end"))
+    center = _point_tuple(stroke.get("center"))
+    if start is None or end is None or center is None:
+        return []
+
+    sx, sy = start
+    ex, ey = end
+    cx, cy = center
+    radius = math.hypot(sx - cx, sy - cy)
+    if radius <= 0.0:
+        return [start, end]
+
+    a0 = math.atan2(sy - cy, sx - cx)
+    a1 = math.atan2(ey - cy, ex - cx)
+    direction = str(stroke.get("direction", "counterclockwise")).lower()
+    two_pi = 2.0 * math.pi
+
+    ccw = (a1 - a0) % two_pi
+    cw = ccw - two_pi
+    if abs(sx - ex) < 1e-9 and abs(sy - ey) < 1e-9:
+        sweep = two_pi if direction == "counterclockwise" else -two_pi
+    else:
+        sweep = cw if direction == "clockwise" else ccw
+
+    arc_len = abs(sweep) * radius
+    steps = max(8, min(2000, int(math.ceil(max(1e-9, arc_len) / max(chord_mm, 1e-4)))))
+
+    out: list[tuple[float, float]] = []
+    for i in range(steps + 1):
+        t = i / steps
+        a = a0 + (sweep * t)
+        out.append((cx + (radius * math.cos(a)), cy + (radius * math.sin(a))))
     return out
 
 

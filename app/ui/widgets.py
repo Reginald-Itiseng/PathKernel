@@ -1,4 +1,6 @@
-﻿from __future__ import annotations
+﻿"""Qt GraphicsView canvas and overlay widgets used by the fallback renderer."""
+
+from __future__ import annotations
 
 from collections import Counter
 from datetime import datetime
@@ -19,6 +21,7 @@ class GraphicsCanvas(QGraphicsView):
     cursor_moved = Signal(float, float)
     zoom_changed = Signal(float)
     scene_clicked = Signal(float, float)
+    layers_moved = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -110,6 +113,7 @@ class GraphicsCanvas(QGraphicsView):
         self._fast_nav_idle_timer.setInterval(120)
         self._fast_nav_idle_timer.timeout.connect(self._finish_fast_navigation)
         self._isolation_view_mode = "width"  # "width" | "centerline"
+        self._hatching_view_mode = "width"  # "width" | "centerline"
         self._cutout_view_mode = "width"  # "width" | "centerline"
         self._drill_view_mode = "width"  # "width" | "centerline"
         self._crosshair_enabled = True
@@ -150,6 +154,19 @@ class GraphicsCanvas(QGraphicsView):
 
     def isolation_view_mode(self) -> str:
         return self._isolation_view_mode
+
+    def set_hatching_view_mode(self, mode: str) -> None:
+        normalized = (mode or "").strip().lower()
+        if normalized not in {"width", "centerline"}:
+            normalized = "width"
+        self._hatching_view_mode = normalized
+        for item in self.scene().items():
+            if isinstance(item, CAMLayerItem):
+                item.set_hatching_view_mode(normalized)
+        self.viewport().update()
+
+    def hatching_view_mode(self) -> str:
+        return self._hatching_view_mode
 
     def set_cutout_view_mode(self, mode: str) -> None:
         normalized = (mode or "").strip().lower()
@@ -192,6 +209,7 @@ class GraphicsCanvas(QGraphicsView):
             layer=layer,
             layer_index=layer_index,
             isolation_view_mode=self._isolation_view_mode,
+            hatching_view_mode=self._hatching_view_mode,
             cutout_view_mode=self._cutout_view_mode,
             drill_view_mode=self._drill_view_mode,
         )
@@ -206,6 +224,21 @@ class GraphicsCanvas(QGraphicsView):
             self.scene().removeItem(handle)
         except Exception:
             return
+
+    def apply_layer_transform_updates(self, layer_indices: list[int]) -> None:
+        target = {int(i) for i in list(layer_indices or [])}
+        if not target:
+            return
+        for item in self.scene().items():
+            if not isinstance(item, CAMLayerItem):
+                continue
+            if int(item.layer_index) not in target:
+                continue
+            try:
+                item.apply_layer_transform()
+            except Exception:
+                continue
+        self.viewport().update()
 
     def fit_scene(self) -> None:
         self._finish_fast_navigation()
@@ -262,10 +295,21 @@ class GraphicsCanvas(QGraphicsView):
             event.accept()
             return
         if self._moving_layers and event.button() == Qt.LeftButton:
+            moved_indices = [int(item.layer_index) for item in self._move_layer_items]
+            end_scene = self.mapToScene(event.pos())
+            moved_mag = math.hypot(
+                float(end_scene.x()) - float(self._move_start_scene.x()),
+                float(end_scene.y()) - float(self._move_start_scene.y()),
+            )
             self._moving_layers = False
             self._move_layer_items = []
             self._move_original_offsets = {}
             self.viewport().update()
+            if moved_indices and moved_mag > 1e-6:
+                try:
+                    self.layers_moved.emit(moved_indices)
+                except Exception:
+                    pass
             event.accept()
             return
         if self._marquee_active and event.button() == Qt.LeftButton:
@@ -956,6 +1000,8 @@ class GraphicsCanvas(QGraphicsView):
 
 
 class _TaskTextOverlay(QWidget):
+    """Transparent overlay that renders task-progress text on top of the canvas."""
+
     def __init__(self, canvas: GraphicsCanvas) -> None:
         super().__init__(canvas.viewport())
         self._canvas = canvas
@@ -979,6 +1025,7 @@ class CAMLayerItem(QGraphicsItem):
         layer: Layer,
         layer_index: int,
         isolation_view_mode: str = "width",
+        hatching_view_mode: str = "width",
         cutout_view_mode: str = "width",
         drill_view_mode: str = "width",
     ) -> None:
@@ -986,6 +1033,7 @@ class CAMLayerItem(QGraphicsItem):
         self.layer = layer
         self.layer_index = layer_index
         self._isolation_view_mode = isolation_view_mode
+        self._hatching_view_mode = hatching_view_mode
         self._cutout_view_mode = cutout_view_mode
         self._drill_view_mode = drill_view_mode
         geometry = build_layer_geometry(layer)
@@ -1009,6 +1057,10 @@ class CAMLayerItem(QGraphicsItem):
         self._isolation_view_mode = mode
         self.update()
 
+    def set_hatching_view_mode(self, mode: str) -> None:
+        self._hatching_view_mode = mode
+        self.update()
+
     def set_cutout_view_mode(self, mode: str) -> None:
         self._cutout_view_mode = mode
         self.update()
@@ -1027,16 +1079,20 @@ class CAMLayerItem(QGraphicsItem):
         color = QColor(self.layer.color)
         kind = self.layer.metadata.get("kind", "").strip().lower()
         is_isolation = kind == "isolation"
+        is_hatching = kind == "hatching_toolpath"
         is_cutout = kind == "cutout_toolpath"
         is_drill = kind == "drill_toolpath"
-        is_toolpath = is_isolation or is_cutout or is_drill
-        toolpath_mode = (
-            self._isolation_view_mode
-            if is_isolation
-            else self._cutout_view_mode
-            if is_cutout
-            else self._drill_view_mode
-        )
+        is_centering = kind == "centering_holes_toolpath"
+        is_surfacing = kind == "surfacing_toolpath"
+        is_toolpath = is_isolation or is_hatching or is_cutout or is_drill or is_centering or is_surfacing
+        if is_isolation:
+            toolpath_mode = self._isolation_view_mode
+        elif is_hatching:
+            toolpath_mode = self._hatching_view_mode
+        elif is_cutout or is_surfacing:
+            toolpath_mode = self._cutout_view_mode
+        else:
+            toolpath_mode = self._drill_view_mode
         for shape in self._shapes:
             if shape.kind == "line":
                 if shape.clear:

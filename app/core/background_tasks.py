@@ -6,7 +6,9 @@ from typing import Any, Callable
 
 from app.core.cutout import CutoutParams, build_cutout_toolpath_layer, extract_cutout_loops
 from app.core.drilling import DrillToolpathParams, build_drill_toolpath_layer
+from app.core.hatching import HatchingParams, build_hatching_toolpath_layer
 from app.core.isolation import IsolationParams, build_isolation_layer
+from app.core.surfacing import SurfacingParams, build_surfacing_toolpath_layer
 from app.core.project import Project
 from app.core.project_store import deserialize_layer, serialize_layer
 
@@ -66,6 +68,27 @@ def _run_task(task_name: str, payload: dict[str, Any], emit_log: Callable[[str],
         layer = build_drill_toolpath_layer(source_layer, Project(), params, log=emit_log)
         return {"generated_layer": serialize_layer(layer)}
 
+    if task_name == "hatching_generate":
+        source_layer = deserialize_layer(dict(payload["source_layer"]))
+        keepout_layers = [deserialize_layer(dict(item)) for item in list(payload.get("keepout_layers", []))]
+        board_layers = [deserialize_layer(dict(item)) for item in list(payload.get("board_layers", []))]
+        params = HatchingParams(**dict(payload["params"]))
+        layer = build_hatching_toolpath_layer(
+            source_layer,
+            Project(),
+            params,
+            keepout_layers=keepout_layers,
+            board_layers=board_layers,
+            log=emit_log,
+        )
+        return {"generated_layer": serialize_layer(layer)}
+
+    if task_name == "surfacing_generate":
+        source_layer = deserialize_layer(dict(payload["source_layer"]))
+        params = SurfacingParams(**dict(payload["params"]))
+        layer = build_surfacing_toolpath_layer(source_layer, Project(), params, log=emit_log)
+        return {"generated_layer": serialize_layer(layer)}
+
     raise ValueError(f"Unknown task: {task_name}")
 
 
@@ -86,4 +109,12 @@ def isolation_params_payload(params: IsolationParams) -> dict[str, Any]:
 
 
 def drill_params_payload(params: DrillToolpathParams) -> dict[str, Any]:
+    return asdict(params)
+
+
+def hatching_params_payload(params: HatchingParams) -> dict[str, Any]:
+    return asdict(params)
+
+
+def surfacing_params_payload(params: SurfacingParams) -> dict[str, Any]:
     return asdict(params)

@@ -1,3 +1,5 @@
+"""High-performance PyQtGraph canvas implementation with inspect/drag interaction support."""
+
 from __future__ import annotations
 
 from collections import Counter
@@ -5,7 +7,7 @@ from datetime import datetime
 import math
 
 import numpy as np
-from PySide6.QtCore import QEvent, QPointF, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPainterPathStroker, QPen, QTransform
 from PySide6.QtWidgets import QGraphicsPathItem, QLabel, QPushButton, QVBoxLayout, QWidget
 
@@ -15,11 +17,12 @@ from app.ui.icons import icon_for
 
 
 class PyQtGraphCanvas(QWidget):
-    """Read-only PyQtGraph renderer with a GraphicsCanvas-compatible API."""
+    """PyQtGraph renderer with GraphicsCanvas-compatible interaction API."""
 
     cursor_moved = Signal(float, float)
     zoom_changed = Signal(float)
     scene_clicked = Signal(float, float)
+    layers_moved = Signal(object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -28,16 +31,31 @@ class PyQtGraphCanvas(QWidget):
         self._plot = None
         self._view = None
         self._items: list[object] = []
+        self._layer_items: dict[int, list[object]] = {}
+        self._layers_by_index: dict[int, Layer] = {}
         self._layer_hit_entries: dict[int, list[dict[str, object]]] = {}
         self._layer_hit_grids: dict[int, dict[tuple[int, int], list[int]]] = {}
         self._layer_hit_cell_mm: dict[int, float] = {}
         self._layer_render_mode: dict[int, str] = {}
         self._toolpath_visual_groups: list[dict[str, object]] = []
+        self._grid_minor_mm = 1.0
+        self._selected_layer_indices: set[int] = set()
+        self._marquee_active = False
+        self._marquee_origin = QPoint()
+        self._marquee_rect = QRect()
+        self._moving_layers = False
+        self._move_start_view = QPointF()
+        self._move_anchor_view = QPointF()
+        self._move_grid_mm = 1.0
+        self._move_layer_indices: list[int] = []
+        self._move_original_offsets: dict[int, tuple[float, float]] = {}
+        self._move_original_entries: dict[int, list[dict[str, object]]] = {}
         self._origin_x_line = None
         self._origin_y_line = None
         self._crosshair_x_line = None
         self._crosshair_y_line = None
         self._isolation_view_mode = "width"
+        self._hatching_view_mode = "width"
         self._cutout_view_mode = "width"
         self._drill_view_mode = "width"
         self._grid_visible = True
@@ -156,15 +174,25 @@ class PyQtGraphCanvas(QWidget):
             except Exception:
                 pass
         self._items.clear()
+        self._layer_items.clear()
+        self._layers_by_index.clear()
         self._layer_hit_entries.clear()
         self._layer_hit_grids.clear()
         self._layer_hit_cell_mm.clear()
         self._layer_render_mode.clear()
         self._toolpath_visual_groups.clear()
+        self._selected_layer_indices.clear()
+        self._marquee_active = False
+        self._moving_layers = False
+        self._move_layer_indices = []
+        self._move_original_offsets = {}
+        self._move_original_entries = {}
+        self._sync_task_overlay_geometry()
 
     def add_layer(self, layer: Layer, layer_index: int):  # noqa: ARG002
         if not self._available or self._plot is None or self._pg is None:
             return None
+        self._layers_by_index[layer_index] = layer
         geom = build_layer_geometry(layer)
         color = QColor(layer.color)
         color.setAlpha(255)
@@ -301,6 +329,7 @@ class PyQtGraphCanvas(QWidget):
                 self._plot.addItem(fill_item)
                 self._items.append(fill_item)
                 added.append(fill_item)
+            self._layer_items[layer_index] = list(added)
             return added
 
         # Fallback path: high-fidelity rendering for imported/complex grouped geometry.
@@ -403,6 +432,7 @@ class PyQtGraphCanvas(QWidget):
                     "width_items": width_items,
                 }
             )
+        self._layer_items[layer_index] = list(added)
         return added
 
     def remove_layer(self, handle) -> None:  # noqa: ANN001
@@ -419,6 +449,21 @@ class PyQtGraphCanvas(QWidget):
             except ValueError:
                 pass
         removed_ids = {id(it) for it in items}
+        to_drop: list[int] = []
+        for layer_index, layer_items in self._layer_items.items():
+            kept = [it for it in layer_items if id(it) not in removed_ids]
+            if kept:
+                self._layer_items[layer_index] = kept
+            else:
+                to_drop.append(int(layer_index))
+        for layer_index in to_drop:
+            self._layer_items.pop(layer_index, None)
+            self._layers_by_index.pop(layer_index, None)
+            self._layer_hit_entries.pop(layer_index, None)
+            self._layer_hit_grids.pop(layer_index, None)
+            self._layer_hit_cell_mm.pop(layer_index, None)
+            self._layer_render_mode.pop(layer_index, None)
+            self._selected_layer_indices.discard(layer_index)
         self._toolpath_visual_groups = [
             g
             for g in self._toolpath_visual_groups
@@ -426,14 +471,40 @@ class PyQtGraphCanvas(QWidget):
                 {id(it) for it in list(g.get("center_items", [])) + list(g.get("width_items", []))}
             )
         ]
+        self._sync_task_overlay_geometry()
 
     def remove_layer_index(self, layer_index: int) -> None:
         idx = int(layer_index)
+        self._layer_items.pop(idx, None)
+        self._layers_by_index.pop(idx, None)
         self._layer_hit_entries.pop(idx, None)
         self._layer_hit_grids.pop(idx, None)
         self._layer_hit_cell_mm.pop(idx, None)
         self._layer_render_mode.pop(idx, None)
+        self._selected_layer_indices.discard(idx)
         self._toolpath_visual_groups = [g for g in self._toolpath_visual_groups if int(g.get("layer_index", -1)) != idx]
+        self._sync_task_overlay_geometry()
+
+    def apply_layer_transform_updates(self, layer_indices: list[int]) -> None:
+        targets = {int(i) for i in list(layer_indices or [])}
+        if not targets:
+            return
+        for layer_index in targets:
+            layer = self._layers_by_index.get(layer_index)
+            if layer is None:
+                continue
+            for item in self._layer_items.get(layer_index, []):
+                try:
+                    _apply_layer_item_transform(item, layer)
+                except Exception:
+                    pass
+            try:
+                geom = build_layer_geometry(layer)
+                self._layer_hit_entries[layer_index] = _build_layer_hit_entries(layer, layer_index, geom.shapes)
+                self._rebuild_layer_hit_grid(layer_index)
+            except Exception:
+                pass
+        self._sync_task_overlay_geometry()
 
     def fit_scene(self) -> None:
         if not self._available or self._view is None:
@@ -488,11 +559,21 @@ class PyQtGraphCanvas(QWidget):
         if self._available and self._plot is not None:
             self._plot.showGrid(x=self._grid_visible, y=self._grid_visible, alpha=0.25)
 
+    def set_grid_minor_mm(self, spacing_mm: float) -> None:
+        self._grid_minor_mm = max(1e-6, float(spacing_mm))
+
     def set_isolation_view_mode(self, mode: str) -> None:
         normalized = (mode or "").strip().lower()
         if normalized not in {"width", "centerline"}:
             normalized = "width"
         self._isolation_view_mode = normalized
+        self._apply_toolpath_modes()
+
+    def set_hatching_view_mode(self, mode: str) -> None:
+        normalized = (mode or "").strip().lower()
+        if normalized not in {"width", "centerline"}:
+            normalized = "width"
+        self._hatching_view_mode = normalized
         self._apply_toolpath_modes()
 
     def set_cutout_view_mode(self, mode: str) -> None:
@@ -659,12 +740,19 @@ class PyQtGraphCanvas(QWidget):
         self._sync_task_overlay_geometry()
 
     def eventFilter(self, watched, event):  # noqa: ANN001, N802
-        if (
-            self._plot is not None
-            and watched is self._plot.viewport()
-            and event.type() in {QEvent.Resize, QEvent.Show}
-        ):
-            self._sync_task_overlay_geometry()
+        if self._plot is not None and watched is self._plot.viewport():
+            et = event.type()
+            if et in {QEvent.Resize, QEvent.Show}:
+                self._sync_task_overlay_geometry()
+            if et == QEvent.MouseButtonPress:
+                if self._on_viewport_mouse_press(event):
+                    return True
+            if et == QEvent.MouseMove:
+                if self._on_viewport_mouse_move(event):
+                    return True
+            if et == QEvent.MouseButtonRelease:
+                if self._on_viewport_mouse_release(event):
+                    return True
         return super().eventFilter(watched, event)
 
     def transform(self):  # noqa: ANN201
@@ -682,6 +770,316 @@ class PyQtGraphCanvas(QWidget):
         self._view.enableAutoRange(False, False)
         self._view.scaleBy((factor, factor))
         self.zoom_changed.emit(1.0)
+
+    def _on_viewport_mouse_press(self, event) -> bool:  # noqa: ANN001
+        if not self._available or self._view is None or self._plot is None:
+            return False
+        try:
+            if event.button() != Qt.LeftButton:
+                return False
+            ctrl = bool(event.modifiers() & Qt.ControlModifier)
+            view_pos = self._view_pos_from_viewport(event.pos())
+            layer_index = self._layer_at_view_pos(view_pos)
+            if layer_index is not None and layer_index in self._selected_layer_indices:
+                self._start_layer_move(event.pos())
+                event.accept()
+                return True
+            if layer_index is None and not ctrl:
+                self._selected_layer_indices.clear()
+            self._marquee_active = True
+            self._marquee_origin = event.pos()
+            self._marquee_rect = QRect(event.pos(), event.pos())
+            self._sync_task_overlay_geometry()
+            event.accept()
+            return True
+        except Exception:
+            return False
+
+    def _on_viewport_mouse_move(self, event) -> bool:  # noqa: ANN001
+        if not self._available or self._view is None or self._plot is None:
+            return False
+        try:
+            if self._moving_layers:
+                self._update_layer_move(self._view_pos_from_viewport(event.pos()))
+                event.accept()
+                return True
+            if self._marquee_active:
+                self._marquee_rect = QRect(self._marquee_origin, event.pos()).normalized()
+                self._sync_task_overlay_geometry()
+                event.accept()
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _on_viewport_mouse_release(self, event) -> bool:  # noqa: ANN001
+        if not self._available or self._view is None or self._plot is None:
+            return False
+        try:
+            if event.button() != Qt.LeftButton:
+                return False
+            view_pos = self._view_pos_from_viewport(event.pos())
+            if self._moving_layers:
+                moved_indices = list(self._move_layer_indices)
+                end_view = self._view_pos_from_viewport(event.pos())
+                moved_mag = math.hypot(
+                    float(end_view.x()) - float(self._move_start_view.x()),
+                    float(end_view.y()) - float(self._move_start_view.y()),
+                )
+                self._moving_layers = False
+                self._move_layer_indices = []
+                self._move_original_offsets = {}
+                self._move_original_entries = {}
+                self._sync_task_overlay_geometry()
+                if moved_indices and moved_mag > 1e-6:
+                    try:
+                        self.layers_moved.emit(moved_indices)
+                    except Exception:
+                        pass
+                event.accept()
+                return True
+            if self._marquee_active:
+                rect = self._marquee_rect.normalized()
+                moved = rect.width() >= 4 or rect.height() >= 4
+                ctrl = bool(event.modifiers() & Qt.ControlModifier)
+                if moved:
+                    self._select_layers_in_view_rect(rect, add=ctrl)
+                else:
+                    if not ctrl:
+                        self._selected_layer_indices.clear()
+                    layer_index = self._layer_at_view_pos(view_pos)
+                    if layer_index is not None:
+                        self._selected_layer_indices.add(layer_index)
+                    self.scene_clicked.emit(float(view_pos.x()), float(view_pos.y()))
+                self._marquee_active = False
+                self._marquee_rect = QRect()
+                self._sync_task_overlay_geometry()
+                event.accept()
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _view_pos_from_viewport(self, viewport_pos: QPoint) -> QPointF:
+        if self._plot is None or self._view is None:
+            return QPointF()
+        try:
+            scene_pos = self._plot.mapToScene(viewport_pos)
+            return QPointF(self._view.mapSceneToView(scene_pos))
+        except Exception:
+            return QPointF()
+
+    def _viewport_pos_from_view(self, view_pos: QPointF) -> QPointF:
+        if self._plot is None or self._view is None:
+            return QPointF()
+        try:
+            scene_pos = self._view.mapViewToScene(view_pos)
+            p = self._plot.mapFromScene(scene_pos)
+            return QPointF(float(p.x()), float(p.y()))
+        except Exception:
+            return QPointF()
+
+    def _layer_at_view_pos(self, view_pos: QPointF) -> int | None:
+        layer_index, _ = self.inspect_at(float(view_pos.x()), float(view_pos.y()), preferred_layer_index=None)
+        return layer_index
+
+    def _select_layers_in_view_rect(self, rect: QRect, *, add: bool) -> None:
+        view_rect = self._view_rect_from_viewport_rect(rect)
+        if not add:
+            self._selected_layer_indices.clear()
+        for layer_index in self._layer_hit_entries.keys():
+            layer_bounds = self._layer_bounds_in_view(layer_index)
+            if layer_bounds is None:
+                continue
+            if layer_bounds.intersects(view_rect):
+                self._selected_layer_indices.add(int(layer_index))
+        self._sync_task_overlay_geometry()
+
+    def _view_rect_from_viewport_rect(self, rect: QRect) -> QRectF:
+        top_left = self._view_pos_from_viewport(rect.topLeft())
+        bottom_right = self._view_pos_from_viewport(rect.bottomRight())
+        left = min(float(top_left.x()), float(bottom_right.x()))
+        right = max(float(top_left.x()), float(bottom_right.x()))
+        top = min(float(top_left.y()), float(bottom_right.y()))
+        bottom = max(float(top_left.y()), float(bottom_right.y()))
+        return QRectF(left, top, max(0.0, right - left), max(0.0, bottom - top))
+
+    def _layer_bounds_in_view(self, layer_index: int) -> QRectF | None:
+        entries = self._layer_hit_entries.get(int(layer_index), [])
+        if not entries:
+            return None
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        for entry in entries:
+            rect = entry.get("rect")
+            if rect is None:
+                continue
+            min_x = min(min_x, float(rect.left()))
+            min_y = min(min_y, float(rect.top()))
+            max_x = max(max_x, float(rect.right()))
+            max_y = max(max_y, float(rect.bottom()))
+        if min_x == float("inf"):
+            return None
+        return QRectF(min_x, min_y, max(0.0, max_x - min_x), max(0.0, max_y - min_y))
+
+    def _start_layer_move(self, start_view_pos: QPoint) -> None:
+        if self._view is None:
+            return
+        layer_indices = [int(i) for i in self._selected_layer_indices if int(i) in self._layers_by_index]
+        if not layer_indices:
+            return
+        union_rect: QRectF | None = None
+        self._move_original_offsets = {}
+        self._move_original_entries = {}
+        for layer_index in layer_indices:
+            layer = self._layers_by_index.get(layer_index)
+            if layer is None:
+                continue
+            bounds = self._layer_bounds_in_view(layer_index)
+            if bounds is None:
+                continue
+            union_rect = bounds if union_rect is None else union_rect.united(bounds)
+            self._move_original_offsets[layer_index] = (
+                float(getattr(layer, "offset_x_mm", 0.0) or 0.0),
+                float(getattr(layer, "offset_y_mm", 0.0) or 0.0),
+            )
+            original_entries: list[dict[str, object]] = []
+            for entry in self._layer_hit_entries.get(layer_index, []):
+                path = entry.get("path")
+                rect = entry.get("rect")
+                copied = dict(entry)
+                if path is not None:
+                    copied["path"] = QPainterPath(path)
+                if rect is not None:
+                    copied["rect"] = QRectF(rect)
+                original_entries.append(copied)
+            self._move_original_entries[layer_index] = original_entries
+        if union_rect is None:
+            return
+        self._move_layer_indices = [idx for idx in layer_indices if idx in self._move_original_offsets]
+        if not self._move_layer_indices:
+            return
+        self._moving_layers = True
+        self._move_start_view = self._view_pos_from_viewport(start_view_pos)
+        self._move_anchor_view = QPointF(union_rect.left(), union_rect.bottom())
+        self._move_grid_mm = max(self._adaptive_grid_spacing_mm(), 1e-6)
+
+    def _update_layer_move(self, current_view: QPointF) -> None:
+        if not self._moving_layers:
+            return
+        delta_x = float(current_view.x()) - float(self._move_start_view.x())
+        delta_y = float(current_view.y()) - float(self._move_start_view.y())
+        target_anchor_x = float(self._move_anchor_view.x()) + delta_x
+        target_anchor_y = float(self._move_anchor_view.y()) + delta_y
+        snapped_anchor_x = round(target_anchor_x / self._move_grid_mm) * self._move_grid_mm
+        snapped_anchor_y = round(target_anchor_y / self._move_grid_mm) * self._move_grid_mm
+        snapped_dx = snapped_anchor_x - float(self._move_anchor_view.x())
+        snapped_dy = snapped_anchor_y - float(self._move_anchor_view.y())
+
+        for layer_index in self._move_layer_indices:
+            layer = self._layers_by_index.get(layer_index)
+            original = self._move_original_offsets.get(layer_index)
+            if layer is None or original is None:
+                continue
+            ox, oy = original
+            layer.offset_x_mm = ox + snapped_dx
+            # View Y is down-positive; project Y is up-positive.
+            layer.offset_y_mm = oy - snapped_dy
+            for item in self._layer_items.get(layer_index, []):
+                try:
+                    _apply_layer_item_transform(item, layer)
+                except Exception:
+                    pass
+
+            translated_entries: list[dict[str, object]] = []
+            for original_entry in self._move_original_entries.get(layer_index, []):
+                moved_entry = dict(original_entry)
+                path = original_entry.get("path")
+                rect = original_entry.get("rect")
+                if path is not None:
+                    p = QPainterPath(path)
+                    p.translate(float(snapped_dx), float(snapped_dy))
+                    moved_entry["path"] = p
+                if rect is not None:
+                    moved_entry["rect"] = QRectF(rect).translated(float(snapped_dx), float(snapped_dy))
+                translated_entries.append(moved_entry)
+            self._layer_hit_entries[layer_index] = translated_entries
+            self._rebuild_layer_hit_grid(layer_index)
+
+        self._sync_task_overlay_geometry()
+
+    def _adaptive_grid_spacing_mm(self) -> float:
+        px_per_mm = max(self._px_per_mm(), 1e-9)
+        base = 24.0 / px_per_mm
+        steps = [
+            0.001,
+            0.002,
+            0.005,
+            0.01,
+            0.02,
+            0.05,
+            0.1,
+            0.2,
+            0.5,
+            1.0,
+            2.0,
+            5.0,
+            10.0,
+            20.0,
+            50.0,
+        ]
+        min_step = max(float(self._grid_minor_mm), 1e-6)
+        for step in steps:
+            if step < min_step:
+                continue
+            if step >= base:
+                return step
+        return max(min_step, base)
+
+    def _px_per_mm(self) -> float:
+        a = self._viewport_pos_from_view(QPointF(0.0, 0.0))
+        b = self._viewport_pos_from_view(QPointF(1.0, 0.0))
+        return abs(float(b.x()) - float(a.x()))
+
+    def _interaction_overlay_active(self) -> bool:
+        return self._marquee_active or bool(self._selected_layer_indices)
+
+    def _draw_interaction_overlay(self, painter: QPainter, overlay_rect: QRect) -> None:  # noqa: ARG002
+        if self._marquee_active and not self._marquee_rect.isNull():
+            outline = QPen(QColor("#8db7ff"))
+            outline.setCosmetic(True)
+            painter.setPen(outline)
+            painter.fillRect(self._marquee_rect, QColor(76, 139, 245, 40))
+            painter.drawRect(self._marquee_rect)
+
+        if not self._selected_layer_indices:
+            return
+        union_view_rect: QRectF | None = None
+        for layer_index in self._selected_layer_indices:
+            layer_rect = self._layer_bounds_in_view(int(layer_index))
+            if layer_rect is None or layer_rect.isNull():
+                continue
+            union_view_rect = layer_rect if union_view_rect is None else union_view_rect.united(layer_rect)
+        if union_view_rect is None:
+            return
+        tl = self._viewport_pos_from_view(union_view_rect.topLeft())
+        br = self._viewport_pos_from_view(union_view_rect.bottomRight())
+        view_rect = QRect(
+            QPoint(int(round(min(tl.x(), br.x()))), int(round(min(tl.y(), br.y())))),
+            QPoint(int(round(max(tl.x(), br.x()))), int(round(max(tl.y(), br.y())))),
+        ).normalized()
+        if view_rect.width() < 2 or view_rect.height() < 2:
+            return
+        fill = QColor(120, 190, 255, 22)
+        border = QPen(QColor("#7ec8ff"))
+        border.setCosmetic(True)
+        border.setWidth(2)
+        border.setStyle(Qt.DashLine)
+        painter.setPen(border)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(view_rect, 4, 4)
 
     def _on_mouse_moved(self, pos) -> None:  # noqa: ANN001
         if not self._available or self._view is None:
@@ -711,6 +1109,10 @@ class PyQtGraphCanvas(QWidget):
         try:
             if event.button() != Qt.LeftButton:
                 return
+            # Left-button interactions are handled on the viewport event filter
+            # to support marquee select + drag move parity with Qt renderer.
+            if self._plot is not None and self._plot.viewport() is not None:
+                return
             scene_pos = event.scenePos()
             p: QPointF = self._view.mapSceneToView(scene_pos)
             self.scene_clicked.emit(float(p.x()), float(p.y()))
@@ -736,6 +1138,7 @@ class PyQtGraphCanvas(QWidget):
         self.append_task_overlay_line(f"[{self._stamp()}] {frame} {msg}")
 
     def _draw_task_overlay(self, painter: QPainter, overlay_rect: QRect) -> None:
+        self._draw_interaction_overlay(painter, overlay_rect)
         if self._task_overlay_dismissed or not self._task_overlay_lines:
             return
         painter.setRenderHint(QPainter.TextAntialiasing, True)
@@ -764,14 +1167,20 @@ class PyQtGraphCanvas(QWidget):
         if vp is None:
             return
         self._task_overlay_widget.setGeometry(vp.rect())
-        if self._task_overlay_dismissed or not self._task_overlay_lines:
+        show_task = (not self._task_overlay_dismissed) and bool(self._task_overlay_lines)
+        show_interaction = self._interaction_overlay_active()
+        if not show_task and not show_interaction:
             self._task_overlay_widget.hide()
             if self._task_overlay_close_button is not None:
                 self._task_overlay_close_button.hide()
             return
         self._task_overlay_widget.show()
         self._task_overlay_widget.raise_()
+        self._task_overlay_widget.update()
         if self._task_overlay_close_button is None:
+            return
+        if not show_task:
+            self._task_overlay_close_button.hide()
             return
         line_h = 14
         pad_x = 10
@@ -869,9 +1278,13 @@ class PyQtGraphCanvas(QWidget):
     def _active_toolpath_mode(self, toolpath_kind: str | None) -> str:
         if toolpath_kind == "isolation":
             return self._isolation_view_mode
+        if toolpath_kind == "hatching_toolpath":
+            return self._hatching_view_mode
         if toolpath_kind == "cutout_toolpath":
             return self._cutout_view_mode
-        if toolpath_kind == "drill_toolpath":
+        if toolpath_kind == "surfacing_toolpath":
+            return self._cutout_view_mode
+        if toolpath_kind in {"drill_toolpath", "centering_holes_toolpath"}:
             return self._drill_view_mode
         return "width"
 
@@ -1183,12 +1596,26 @@ def _should_flatten_toolpath_layer(layer: Layer) -> bool:
     if getattr(layer, "kind", "") != "geometry":
         return False
     kind = str(getattr(layer, "metadata", {}).get("kind", "")).strip().lower()
-    return kind in {"isolation", "cutout_toolpath", "drill_toolpath"}
+    return kind in {
+        "isolation",
+        "hatching_toolpath",
+        "cutout_toolpath",
+        "drill_toolpath",
+        "surfacing_toolpath",
+        "centering_holes_toolpath",
+    }
 
 
 def _toolpath_kind(layer: Layer) -> str | None:
     kind = str(getattr(layer, "metadata", {}).get("kind", "")).strip().lower()
-    if kind in {"isolation", "cutout_toolpath", "drill_toolpath"}:
+    if kind in {
+        "isolation",
+        "hatching_toolpath",
+        "cutout_toolpath",
+        "drill_toolpath",
+        "surfacing_toolpath",
+        "centering_holes_toolpath",
+    }:
         return kind
     return None
 

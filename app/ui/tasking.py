@@ -1,3 +1,5 @@
+"""Qt thread/task helpers used to run blocking operations without freezing the UI."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -105,6 +107,7 @@ class TaskConsoleWidget(QWidget):
 
 
 def start_worker_thread(parent: QObject, work: TaskFunc) -> tuple[QThread, TaskWorker]:
+    """Create and wire a worker-thread pair without starting execution yet."""
     thread = QThread(parent)
     worker = TaskWorker(work)
     worker.moveToThread(thread)

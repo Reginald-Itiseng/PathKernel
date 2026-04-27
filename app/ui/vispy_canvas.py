@@ -1,3 +1,5 @@
+"""Fallback VisPy renderer with GraphicsCanvas-compatible signal surface."""
+
 from __future__ import annotations
 
 import math

@@ -1,3 +1,5 @@
+"""Project serialization/deserialization helpers for persistent .pkproj state."""
+
 from __future__ import annotations
 
 import base64
@@ -34,6 +36,7 @@ _TYPE_CACHE: dict[str, type] = {}
 
 
 def save_project(path: Path, project: Project) -> None:
+    """Write an in-memory project model to disk in PathKernel JSON format."""
     payload = {
         "version": PROJECT_FILE_VERSION,
         "workspace": {
@@ -48,6 +51,7 @@ def save_project(path: Path, project: Project) -> None:
 
 
 def load_project(path: Path) -> Project:
+    """Load a PathKernel project file and rebuild the runtime project model."""
     path = Path(path)
     data = json.loads(path.read_text(encoding="utf-8"))
     if int(data.get("version", 0)) != PROJECT_FILE_VERSION:
@@ -66,10 +70,12 @@ def load_project(path: Path) -> Project:
 
 
 def serialize_layer(layer: Layer) -> dict[str, Any]:
+    """Convert a Layer object into a process-safe dictionary payload."""
     return _encode_layer(layer)
 
 
 def deserialize_layer(data: dict[str, Any]) -> Layer:
+    """Rebuild a Layer object from a dictionary payload."""
     return _decode_layer(data)
 
 
@@ -117,6 +123,10 @@ def _decode_layer(data: dict[str, Any]) -> Layer:
         if isinstance(value, dict):
             primitive_overrides[idx] = {str(k): v for k, v in value.items()}
 
+    role = str(data.get("role", "unassigned"))
+    if role == "holes":
+        role = "drills"
+
     return Layer(
         name=str(data.get("name", "layer")),
         path=Path(str(data.get("path", ""))),
@@ -130,7 +140,7 @@ def _decode_layer(data: dict[str, Any]) -> Layer:
         rotation_deg=float(data.get("rotation_deg", 0.0)),
         mirror_x=bool(data.get("mirror_x", False)),
         mirror_y=bool(data.get("mirror_y", False)),
-        role=str(data.get("role", "unassigned")),
+        role=role,
         primitive_overrides=primitive_overrides,
         manual_edits=edits,
         bbox=bbox,

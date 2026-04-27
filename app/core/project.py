@@ -1,3 +1,5 @@
+"""Core project data model: layers, transforms and tool-library state."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -21,7 +23,7 @@ DEFAULT_LAYER_COLORS = [
     "#455a64",
 ]
 
-LAYER_ROLES = ("unassigned", "top", "bottom", "holes", "cutout")
+LAYER_ROLES = ("unassigned", "top", "bottom", "drills", "cutout", "artwork")
 TOOL_PROFILES = ("cylindrical/flute", "conical")
 
 
@@ -44,6 +46,8 @@ class ManualEdit:
 
 @dataclass(slots=True)
 class Layer:
+    """One logical CAM layer with rendering state and optional local transform overrides."""
+
     name: str
     path: Path
     kind: str
@@ -96,6 +100,7 @@ class ToolDefinition:
 
 
 def default_tool_library(count: int = 50) -> list[ToolDefinition]:
+    """Create an empty numbered tool table used by default for new projects."""
     slots = max(1, int(count))
     return [
         ToolDefinition(
@@ -109,6 +114,8 @@ def default_tool_library(count: int = 50) -> list[ToolDefinition]:
 
 @dataclass(slots=True)
 class Project:
+    """Root in-memory project state container used by UI and geometry generators."""
+
     layers: list[Layer] = field(default_factory=list)
     workspace: WorkspaceTransform = field(default_factory=WorkspaceTransform)
     tool_library: list[ToolDefinition] = field(default_factory=default_tool_library)
@@ -138,6 +145,9 @@ class Project:
         self.layers[index].color = color
 
     def set_layer_role(self, index: int, role: str) -> None:
+        # Backward compatibility with older role key.
+        if role == "holes":
+            role = "drills"
         if role not in LAYER_ROLES:
             role = "unassigned"
         self.layers[index].role = role

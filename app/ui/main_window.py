@@ -6,6 +6,7 @@ import logging
 import multiprocessing as mp
 from pathlib import Path
 from queue import Empty
+from types import SimpleNamespace
 
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont
@@ -38,19 +39,26 @@ from app.core.io import import_files, scan_folder
 from app.core.background_tasks import (
     cutout_params_payload,
     drill_params_payload,
+    hatching_params_payload,
     isolation_params_payload,
+    surfacing_params_payload,
     run_task_process_entry,
 )
 from app.core.drilling import DrillToolpathParams
 from app.core.cutout import CutoutParams, extract_cutout_loops
 from app.core.cnc_params import calculate_coppercam_params
+from app.core.centering_holes import CenteringHolesParams, build_centering_holes_toolpath_layer
+from app.core.hatching import HatchingParams
 from app.core.hpgl import HPGLExportOptions, export_layers_to_hpgl, is_toolpath_layer
 from app.core.isolation import IsolationParams, build_isolation_layer
-from app.core.project import Project, ToolDefinition, default_tool_library
+from app.core.surfacing import SurfacingParams
+from app.core.project import Layer, Project, ToolDefinition, default_tool_library
 from app.core.project_store import deserialize_layer, load_project, save_project, serialize_layer
+from app.ui.centering_holes_wizard_dialog import CenteringHolesWizardDialog
 from app.ui.icons import icon_for
 from app.ui.pyqtgraph_canvas import PyQtGraphCanvas
 from app.ui.selected_tools_dialog import SelectedToolsDialog
+from app.ui.surfacing_dialog import SurfacingToolpathDialog
 from app.ui.tool_library_dialog import ToolLibraryDialog
 from app.ui.widgets import GraphicsCanvas
 
@@ -371,9 +379,15 @@ class MainWindow(QMainWindow):
         self.generate_isolation_action = QAction("Generate Isolation Geometry", self)
         self.generate_cutout_toolpath_action = QAction("Generate Cutout Toolpath", self)
         self.generate_drill_toolpath_action = QAction("Generate Drill Toolpath", self)
+        self.generate_centering_holes_action = QAction("Generate Centering Holes Toolpath", self)
+        self.generate_hatching_toolpath_action = QAction("Generate Hatching Toolpath", self)
+        self.generate_surfacing_toolpath_action = QAction("Generate Surfacing Toolpath", self)
         tools_menu.addAction(self.generate_isolation_action)
+        tools_menu.addAction(self.generate_hatching_toolpath_action)
         tools_menu.addAction(self.generate_cutout_toolpath_action)
         tools_menu.addAction(self.generate_drill_toolpath_action)
+        tools_menu.addAction(self.generate_centering_holes_action)
+        tools_menu.addAction(self.generate_surfacing_toolpath_action)
 
         parameters_menu = self.menuBar().addMenu("Parameters")
         self.tool_library_action = QAction("Tool library...", self)
@@ -433,8 +447,11 @@ class MainWindow(QMainWindow):
         self._apply_action_icon(self.debug_geometry_dump_action, "view_debug_dump")
 
         self._apply_action_icon(self.generate_isolation_action, "tool_generate_isolation")
+        self._apply_action_icon(self.generate_hatching_toolpath_action, "tool_generate_isolation")
         self._apply_action_icon(self.generate_cutout_toolpath_action, "tool_generate_cutout")
         self._apply_action_icon(self.generate_drill_toolpath_action, "tool_generate_drill")
+        self._apply_action_icon(self.generate_centering_holes_action, "tool_generate_drill")
+        self._apply_action_icon(self.generate_surfacing_toolpath_action, "tool_generate_cutout")
         self._apply_action_icon(self.tool_library_action, "param_tool_library")
         self._apply_action_icon(self.selected_tools_action, "param_selected_tools")
 
@@ -499,8 +516,11 @@ class MainWindow(QMainWindow):
         self.renderer_qt_action.triggered.connect(lambda: self._switch_renderer("qt"))
         self.renderer_pyqtgraph_action.triggered.connect(lambda: self._switch_renderer("pyqtgraph"))
         self.generate_isolation_action.triggered.connect(self._generate_isolation_geometry)
+        self.generate_hatching_toolpath_action.triggered.connect(self._generate_hatching_toolpath)
         self.generate_cutout_toolpath_action.triggered.connect(self._open_cutout_planner)
         self.generate_drill_toolpath_action.triggered.connect(self._generate_drill_toolpath)
+        self.generate_centering_holes_action.triggered.connect(self._generate_centering_holes_toolpath)
+        self.generate_surfacing_toolpath_action.triggered.connect(self._generate_surfacing_toolpath)
         self.tool_library_action.triggered.connect(self._open_tool_library)
         self.selected_tools_action.triggered.connect(self._open_selected_tools)
 
@@ -740,7 +760,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Export HPGL",
-                "No generated toolpath layers found.\nGenerate isolation/cutout/drill toolpaths first.",
+                "No generated toolpath layers found.\nGenerate isolation/cutout/drill/centering/surfacing toolpaths first.",
             )
             return
 
@@ -1403,6 +1423,139 @@ class MainWindow(QMainWindow):
             failure_title="Isolation Failed",
         )
 
+    def _generate_hatching_toolpath(self) -> None:
+        if self._task_running:
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
+            return
+        index = self._current_layer_index()
+        if index is None or index < 0 or index >= len(self.project.layers):
+            QMessageBox.information(self, "Hatching Toolpath", "Select a top/bottom copper Gerber layer first.")
+            return
+
+        source_layer = self.project.layers[index]
+        source_name = source_layer.name
+        if source_layer.kind != "gerber":
+            QMessageBox.information(self, "Hatching Toolpath", "Hatching currently supports Gerber copper layers only.")
+            return
+        if str(getattr(source_layer, "role", "unassigned")).strip().lower() not in {"top", "bottom", "artwork", "unassigned"}:
+            QMessageBox.information(
+                self,
+                "Hatching Toolpath",
+                "Select a copper/artwork Gerber layer, not a drill or cutout layer.",
+            )
+            return
+
+        hatching_tool = self._selected_hatching_tool()
+        if hatching_tool is None:
+            QMessageBox.information(
+                self,
+                "Hatching Toolpath",
+                "No hatching tool selected. Configure it in Parameters > Selected tools...",
+            )
+            return
+
+        hatch_angle, ok = QInputDialog.getDouble(
+            self,
+            "Hatching Angle",
+            "Hatch angle (degrees):",
+            0.0,
+            -360.0,
+            360.0,
+            2,
+        )
+        if not ok:
+            return
+
+        boundary_margin, ok = QInputDialog.getDouble(
+            self,
+            "Hatching Boundary Margin",
+            "Extra clearing margin outside copper bounds (mm):",
+            1.0,
+            0.0,
+            1000.0,
+            3,
+        )
+        if not ok:
+            return
+
+        copper_keepout_margin, ok = QInputDialog.getDouble(
+            self,
+            "Copper Keepout",
+            "Extra keepout around copper features (mm):",
+            0.0,
+            0.0,
+            1000.0,
+            3,
+        )
+        if not ok:
+            return
+
+        tool_dia = max(0.001, self._safe_float(getattr(hatching_tool, "diameter_mm", 0.2), 0.2))
+        hatching_depth = max(0.0, self._safe_float(self._selected_tools_assignments.get("hatching_depth_mm"), 0.0))
+        hatching_margin = max(0.0, self._safe_float(self._selected_tools_assignments.get("hatching_margin_mm"), 0.0))
+        tool_profile = str(getattr(hatching_tool, "profile", "cylindrical/flute") or "cylindrical/flute")
+        tool_tip_dia = max(0.0, self._safe_float(getattr(hatching_tool, "tip_diameter_mm", 0.0), 0.0))
+        tool_angle = max(0.0, self._safe_float(getattr(hatching_tool, "angle_deg", 0.0), 0.0))
+        params = HatchingParams(
+            tool_diameter_mm=tool_dia,
+            tool_profile=tool_profile,
+            tool_tip_diameter_mm=tool_tip_dia,
+            tool_angle_deg=tool_angle,
+            cutting_depth_mm=hatching_depth,
+            hatching_margin_mm=hatching_margin,
+            hatch_angle_deg=float(hatch_angle),
+            copper_keepout_margin_mm=float(copper_keepout_margin),
+            boundary_margin_mm=float(boundary_margin),
+        )
+
+        keepout_layers = [
+            layer
+            for layer in self.project.layers
+            if layer is not source_layer
+            and str(layer.metadata.get("kind", "")).strip().lower()
+            in {"isolation_toolpath", "cutout_toolpath", "drill_toolpath", "centering_holes_toolpath"}
+        ]
+        board_layers = [
+            layer
+            for layer in self.project.layers
+            if layer is not source_layer
+            and str(getattr(layer, "role", "unassigned")).strip().lower() == "cutout"
+            and layer.kind in {"gerber", "geometry"}
+        ]
+
+        def on_done(layer):
+            tool_label = str(getattr(hatching_tool, "tool_number", "") or "").strip()
+            if not tool_label:
+                tool_label = str(getattr(hatching_tool, "slot", ""))
+            layer.metadata["selected_hatching_tool"] = tool_label
+            layer.metadata["selected_hatching_depth_mm"] = f"{hatching_depth:.6f}"
+            layer.metadata["selected_hatching_speed_mm_s"] = (
+                f"{self._safe_float(self._selected_tools_assignments.get('hatching_speed_mm_s'), 0.0):.6f}"
+            )
+            self.project.add_layer(layer)
+            self._rebuild_scene()
+            self._select_layer_item(len(self.project.layers) - 1)
+            self._fit_canvas_to_viewport()
+            line_count = len(list(getattr(getattr(layer, "source", None), "primitives", []) or []))
+            self.statusBar().showMessage(
+                f"Hatching toolpath generated from '{source_name}' using hatching tool {tool_label} ({line_count} segment(s))",
+                5000,
+            )
+
+        self._run_process_task(
+            title=f"Hatching Toolpath {source_name}",
+            task_name="hatching_generate",
+            payload={
+                "source_layer": serialize_layer(source_layer),
+                "params": hatching_params_payload(params),
+                "keepout_layers": [serialize_layer(layer) for layer in keepout_layers],
+                "board_layers": [serialize_layer(layer) for layer in board_layers],
+            },
+            decode_result=lambda data: deserialize_layer(dict(data["generated_layer"])),
+            on_success=on_done,
+            failure_title="Hatching Toolpath Failed",
+        )
+
     def _generate_drill_toolpath(self) -> None:
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
@@ -1490,36 +1643,284 @@ class MainWindow(QMainWindow):
             failure_title="Drill Toolpath Failed",
         )
 
+    def _generate_centering_holes_toolpath(self) -> None:
+        if self._task_running:
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
+            return
+
+        board_bounds = self._imported_board_bbox()
+        if board_bounds is None:
+            QMessageBox.information(
+                self,
+                "Centering Holes",
+                "No imported board layers found. Import top/bottom/cutout/artwork first.",
+            )
+            return
+
+        centering_tool = self._selected_centering_tool()
+        if centering_tool is None:
+            QMessageBox.information(
+                self,
+                "Centering Holes",
+                "No centering tool selected. Configure it in Parameters > Selected tools...",
+            )
+            return
+
+        tool_dia = max(0.001, self._safe_float(getattr(centering_tool, "diameter_mm", 0.0), 0.0))
+        hole_dia = max(
+            0.001,
+            self._safe_float(
+                self._selected_tools_assignments.get("centering_hole_diameter_mm"),
+                tool_dia,
+            ),
+        )
+        extra_depth = max(0.0, self._safe_float(self._selected_tools_assignments.get("centering_extra_depth_mm"), 0.0))
+
+        dlg = CenteringHolesWizardDialog(
+            self,
+            hole_diameter_mm=hole_dia,
+            initial_distance_mm=12.0,
+            board_bounds_mm=board_bounds,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        source_layer = self._first_reference_layer(default_bounds=board_bounds)
+        params = CenteringHolesParams(
+            board_min_x_mm=board_bounds[0],
+            board_min_y_mm=board_bounds[1],
+            board_max_x_mm=board_bounds[2],
+            board_max_y_mm=board_bounds[3],
+            orientation=dlg.selected_orientation(),
+            outline_to_hole_center_mm=max(0.0, dlg.selected_distance_mm()),
+            hole_diameter_mm=hole_dia,
+            tool_diameter_mm=tool_dia,
+            extra_depth_mm=extra_depth,
+        )
+        try:
+            layer = build_centering_holes_toolpath_layer(source_layer, self.project, params)
+        except Exception as exc:
+            QMessageBox.warning(self, "Centering Holes Failed", str(exc))
+            return
+
+        tool_label = str(getattr(centering_tool, "tool_number", "") or "").strip()
+        if not tool_label:
+            tool_label = str(getattr(centering_tool, "slot", ""))
+        layer.metadata["selected_centering_tool"] = tool_label
+        # Reuse existing drill HPGL metadata keys for tool selection.
+        layer.metadata["selected_drill_tool"] = tool_label
+        layer.metadata["selected_drill_depth_mm"] = f"{extra_depth:.6f}"
+
+        self.project.add_layer(layer)
+        self._rebuild_scene()
+        self._select_layer_item(len(self.project.layers) - 1)
+        self._fit_canvas_to_viewport()
+        self.statusBar().showMessage(
+            (
+                f"Centering holes toolpath generated (orientation: {dlg.selected_orientation()}, "
+                f"distance: {dlg.selected_distance_mm():.3f} mm)"
+            ),
+            5000,
+        )
+
+    def _generate_surfacing_toolpath(self) -> None:
+        if self._task_running:
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
+            return
+
+        index = self._current_layer_index()
+        selected_layer = None
+        if index is not None and 0 <= index < len(self.project.layers):
+            selected_layer = self.project.layers[index]
+
+        default_bounds = None
+        if selected_layer is not None:
+            default_bounds = self._layer_bbox_or_none(selected_layer)
+        if default_bounds is None:
+            default_bounds = self._imported_board_bbox()
+        if default_bounds is None:
+            default_bounds = (0.0, 0.0, 100.0, 100.0)
+
+        source_layer = selected_layer if selected_layer is not None else self._first_reference_layer(default_bounds=default_bounds)
+        source_name = source_layer.name if selected_layer is not None else "manual area"
+        cutting_slot = self._selected_tools_assignments.get("cutting")
+        default_tool_slot = int(cutting_slot) if isinstance(cutting_slot, int) else None
+
+        dlg = SurfacingToolpathDialog(
+            default_bounds=self._layer_bbox_for_dialog(source_layer, fallback=default_bounds),
+            tools=list(self._global_tool_library),
+            default_tool_slot=default_tool_slot,
+            parent=self,
+        )
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        dialog_payload = dict(dlg.params_payload())
+        selected_tool_slot = dialog_payload.pop("selected_tool_slot", None)
+        surfacing_tool = self._tool_by_slot(selected_tool_slot if isinstance(selected_tool_slot, int) else None)
+        params = SurfacingParams(**dialog_payload)
+
+        def on_done(layer):
+            tool_summary = f"manual dia {params.tool_diameter_mm:.3f} mm"
+            if surfacing_tool is not None:
+                tool_label = str(getattr(surfacing_tool, "tool_number", "") or "").strip()
+                if not tool_label:
+                    tool_label = str(getattr(surfacing_tool, "slot", ""))
+                layer.metadata["selected_cutting_tool"] = tool_label
+                layer.metadata["selected_surfacing_tool"] = tool_label
+                tool_summary = f"tool {tool_label}"
+            layer.metadata["selected_cutting_depth_mm"] = (
+                f"{self._safe_float(self._selected_tools_assignments.get('cutting_depth_mm'), 0.0):.6f}"
+            )
+            layer.metadata["selected_cutting_speed_mm_s"] = (
+                f"{self._safe_float(self._selected_tools_assignments.get('cutting_speed_mm_s'), 0.0):.6f}"
+            )
+            self.project.add_layer(layer)
+            self._rebuild_scene()
+            self._select_layer_item(len(self.project.layers) - 1)
+            self._fit_canvas_to_viewport()
+
+            pass_count = self._safe_int(layer.metadata.get("surfacing_pass_count"), 0)
+            min_x = self._safe_float(layer.metadata.get("surfacing_bounds_min_x_mm"), 0.0)
+            max_x = self._safe_float(layer.metadata.get("surfacing_bounds_max_x_mm"), 0.0)
+            min_y = self._safe_float(layer.metadata.get("surfacing_bounds_min_y_mm"), 0.0)
+            max_y = self._safe_float(layer.metadata.get("surfacing_bounds_max_y_mm"), 0.0)
+            self.statusBar().showMessage(
+                (
+                    f"Surfacing toolpath generated from '{source_name}' "
+                    f"for bbox X[{min_x:.3f},{max_x:.3f}] Y[{min_y:.3f},{max_y:.3f}] "
+                    f"with {pass_count} pass(es), {tool_summary}"
+                ),
+                5000,
+            )
+
+        self._run_process_task(
+            title=f"Surfacing Toolpath {source_name}",
+            task_name="surfacing_generate",
+            payload={
+                "source_layer": serialize_layer(source_layer),
+                "params": surfacing_params_payload(params),
+            },
+            decode_result=lambda data: deserialize_layer(dict(data["generated_layer"])),
+            on_success=on_done,
+            failure_title="Surfacing Toolpath Failed",
+        )
+
+    def _layer_bbox_for_dialog(
+        self,
+        layer,
+        *,
+        fallback: tuple[float, float, float, float] = (0.0, 0.0, 100.0, 100.0),
+    ) -> tuple[float, float, float, float]:
+        out = self._layer_bbox_or_none(layer)
+        if out is not None:
+            return out
+        return fallback
+
+    def _layer_bbox_or_none(self, layer) -> tuple[float, float, float, float] | None:
+        bbox = getattr(layer, "bbox", None)
+        if isinstance(bbox, tuple) and len(bbox) == 4:
+            try:
+                min_x = float(bbox[0])
+                min_y = float(bbox[1])
+                max_x = float(bbox[2])
+                max_y = float(bbox[3])
+                if (max_x - min_x) > 1e-9 and (max_y - min_y) > 1e-9:
+                    return min_x, min_y, max_x, max_y
+            except Exception:
+                pass
+
+        src_bounds = getattr(getattr(layer, "source", None), "bounds", None)
+        if isinstance(src_bounds, tuple) and len(src_bounds) == 2:
+            try:
+                x_pair, y_pair = src_bounds
+                min_x = float(min(x_pair[0], x_pair[1]))
+                max_x = float(max(x_pair[0], x_pair[1]))
+                min_y = float(min(y_pair[0], y_pair[1]))
+                max_y = float(max(y_pair[0], y_pair[1]))
+                if (max_x - min_x) > 1e-9 and (max_y - min_y) > 1e-9:
+                    return min_x, min_y, max_x, max_y
+            except Exception:
+                pass
+        return None
+
+    def _imported_board_bbox(self) -> tuple[float, float, float, float] | None:
+        preferred = self._imported_bbox_for_roles({"top", "bottom", "cutout", "artwork"})
+        if preferred is not None:
+            return preferred
+        return self._imported_bbox_for_roles(None)
+
+    def _imported_bbox_for_roles(self, roles: set[str] | None) -> tuple[float, float, float, float] | None:
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        found = False
+        for layer in self.project.layers:
+            if self._is_generated_layer(layer):
+                continue
+            role = str(getattr(layer, "role", "unassigned")).strip().lower()
+            if roles is not None and role not in roles:
+                continue
+            bbox = self._layer_bbox_or_none(layer)
+            if bbox is None:
+                continue
+            bx0, by0, bx1, by1 = bbox
+            min_x = min(min_x, bx0)
+            min_y = min(min_y, by0)
+            max_x = max(max_x, bx1)
+            max_y = max(max_y, by1)
+            found = True
+        if not found:
+            return None
+        return min_x, min_y, max_x, max_y
+
+    def _first_reference_layer(self, *, default_bounds: tuple[float, float, float, float]) -> Layer:
+        for layer in self.project.layers:
+            if not self._is_generated_layer(layer):
+                return layer
+        if self.project.layers:
+            return self.project.layers[0]
+        return self._virtual_reference_layer(default_bounds=default_bounds)
+
+    def _virtual_reference_layer(self, *, default_bounds: tuple[float, float, float, float]) -> Layer:
+        min_x, min_y, max_x, max_y = default_bounds
+        source = SimpleNamespace(
+            units="mm",
+            primitives=[],
+            bounds=((float(min_x), float(max_x)), (float(min_y), float(max_y))),
+        )
+        return Layer(
+            name="manual_reference",
+            path=Path("manual_reference.virtual"),
+            kind="geometry",
+            source=source,
+            role="unassigned",
+            bbox=(float(min_x), float(min_y), float(max_x), float(max_y)),
+            metadata={"virtual_source": "true"},
+        )
+
     def _selected_engraving_tool(self):
         slot_value = self._selected_tools_assignments.get("engraving")
-        if not isinstance(slot_value, int):
-            return None
-        for tool in self._global_tool_library:
-            if not bool(getattr(tool, "defined", False)):
-                continue
-            try:
-                if int(getattr(tool, "slot", -1)) == int(slot_value):
-                    return tool
-            except Exception:
-                continue
-        return None
+        return self._tool_by_slot(slot_value if isinstance(slot_value, int) else None)
+
+    def _selected_hatching_tool(self):
+        slot_value = self._selected_tools_assignments.get("hatching")
+        return self._tool_by_slot(slot_value if isinstance(slot_value, int) else None)
 
     def _selected_cutting_tool(self):
         slot_value = self._selected_tools_assignments.get("cutting")
-        if not isinstance(slot_value, int):
-            return None
-        for tool in self._global_tool_library:
-            if not bool(getattr(tool, "defined", False)):
-                continue
-            try:
-                if int(getattr(tool, "slot", -1)) == int(slot_value):
-                    return tool
-            except Exception:
-                continue
-        return None
+        return self._tool_by_slot(slot_value if isinstance(slot_value, int) else None)
+
+    def _selected_centering_tool(self):
+        slot_value = self._selected_tools_assignments.get("centering")
+        return self._tool_by_slot(slot_value if isinstance(slot_value, int) else None)
 
     def _selected_drill_single_tool(self):
         slot_value = self._selected_tools_assignments.get("drill_single_tool_slot")
+        return self._tool_by_slot(slot_value if isinstance(slot_value, int) else None)
+
+    def _tool_by_slot(self, slot_value: int | None):
         if not isinstance(slot_value, int):
             return None
         for tool in self._global_tool_library:
@@ -2461,8 +2862,11 @@ class MainWindow(QMainWindow):
             self.open_folder_action,
             self.clear_action,
             self.generate_isolation_action,
+            self.generate_hatching_toolpath_action,
             self.generate_cutout_toolpath_action,
             self.generate_drill_toolpath_action,
+            self.generate_centering_holes_action,
+            self.generate_surfacing_toolpath_action,
             self.tool_library_action,
             self.selected_tools_action,
             self.renderer_qt_action,

@@ -35,11 +35,12 @@ EXCELLON_EXTENSIONS = {
 }
 
 ROLE_DEFAULT_STYLE = {
-    # KiCad-like copper colors rendered fully opaque.
-    "top": ("#C83434", 1.0),
-    "bottom": ("#4D7FC4", 1.0),
-    "holes": ("#D8A33D", 1.0),
+    # User-requested copper colors rendered fully opaque.
+    "top": ("#4D7FC4", 1.0),
+    "bottom": ("#C83434", 1.0),
+    "drills": ("#D8A33D", 1.0),
     "cutout": ("#B8C0CC", 1.0),
+    "artwork": ("#9B7FEA", 1.0),
 }
 
 
@@ -202,13 +203,16 @@ def _guess_role(path: Path, kind: str) -> str:
     name = path.stem.lower()
     ext = path.suffix.lower()
     if kind == "excellon" or ext in {".drl", ".xln", ".drd"}:
-        return "holes"
+        return "drills"
     if "edge" in name or "cuts" in name or "outline" in name or ext in {".gko", ".gm1"}:
         return "cutout"
     if "f_cu" in name or "top" in name or ext in {".gtl"}:
         return "top"
     if "b_cu" in name or "bottom" in name or ext in {".gbl"}:
         return "bottom"
+    # Default ambiguous Gerber layers to artwork so users can reassign explicitly.
+    if kind == "gerber":
+        return "artwork"
     return "unassigned"
 
 

@@ -1,3 +1,5 @@
+"""Icon loading and theme-aware SVG recoloring utilities used across the UI."""
+
 from __future__ import annotations
 
 import json
@@ -152,6 +154,7 @@ def icon_for(
     color: str | QColor | None = None,
     stroke_scale: float = 1.0,
 ) -> QIcon:
+    """Resolve an icon from the manifest and optionally recolor/retune stroke width."""
     icon_id = str(icon_id or "").strip()
     if not icon_id:
         return QIcon()

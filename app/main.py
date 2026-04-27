@@ -1,3 +1,5 @@
+"""Application bootstrap for the PathKernel desktop CAM UI."""
+
 from __future__ import annotations
 
 import logging
@@ -10,6 +12,7 @@ from app.ui.main_window import MainWindow
 
 
 def configure_logging() -> None:
+    """Initialize process-wide logging format and verbosity."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
@@ -17,6 +20,7 @@ def configure_logging() -> None:
 
 
 def main() -> int:
+    """Create the Qt application, show the main window, and run the event loop."""
     configure_logging()
     app = QApplication(sys.argv)
     app.setOrganizationName("PathKernel")
