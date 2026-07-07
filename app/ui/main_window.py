@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import logging
+import math
 import multiprocessing as mp
 from pathlib import Path
 from queue import Empty
@@ -11,6 +12,7 @@ from types import SimpleNamespace
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QFont
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QComboBox,
     QDialog,
     QDockWidget,
@@ -25,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QDoubleSpinBox,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -35,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.core.io import import_files, scan_folder
+from app.core.io import ROLE_DEFAULT_STYLE, import_files, scan_folder
 from app.core.background_tasks import (
     cutout_params_payload,
     drill_params_payload,
@@ -47,7 +50,11 @@ from app.core.background_tasks import (
 from app.core.drilling import DrillToolpathParams
 from app.core.cutout import CutoutParams, extract_cutout_loops
 from app.core.cnc_params import calculate_coppercam_params
-from app.core.centering_holes import CenteringHolesParams, build_centering_holes_toolpath_layer
+from app.core.centering_holes import (
+    CenteringHolesParams,
+    build_centering_holes_toolpath_layer,
+    centering_hole_mirror_axis,
+)
 from app.core.hatching import HatchingParams
 from app.core.hpgl import HPGLExportOptions, export_layers_to_hpgl, is_toolpath_layer
 from app.core.isolation import IsolationParams, build_isolation_layer
@@ -56,6 +63,7 @@ from app.core.project import Layer, Project, ToolDefinition, default_tool_librar
 from app.core.project_store import deserialize_layer, load_project, save_project, serialize_layer
 from app.ui.centering_holes_wizard_dialog import CenteringHolesWizardDialog
 from app.ui.icons import icon_for
+from app.ui.layer_roles_dialog import LayerRoleEntry, LayerRolesDialog
 from app.ui.pyqtgraph_canvas import PyQtGraphCanvas
 from app.ui.selected_tools_dialog import SelectedToolsDialog
 from app.ui.surfacing_dialog import SurfacingToolpathDialog
@@ -85,7 +93,9 @@ class MainWindow(QMainWindow):
         self._cutout_preview_locked_until_reopen = False
         self._cutout_plan_active = False
         self._cutout_plan_source_layer_index: int | None = None
+        self._cutout_plan_source_layer_indices: list[int] = []
         self._cutout_plan_loops = []
+        self._cutout_plan_loop_source_positions: list[int] = []
         self._cutout_plan_compensations: list[str] = []
         self._task_running = False
         self._task_process: mp.Process | None = None
@@ -123,6 +133,7 @@ class MainWindow(QMainWindow):
         self.layer_tree.setColumnCount(2)
         self.layer_tree.setHeaderHidden(True)
         self.layer_tree.setRootIsDecorated(True)
+        self.layer_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.layer_tree.setUniformRowHeights(True)
         self.layer_tree.setIndentation(14)
         self.layer_tree.setTextElideMode(Qt.ElideRight)
@@ -133,6 +144,8 @@ class MainWindow(QMainWindow):
         self._layer_index_to_item: dict[int, QTreeWidgetItem] = {}
         self._import_group_expanded = False
         self._generated_group_expanded = True
+        self.mirror_layer_button: QPushButton | None = None
+        self.reassign_layers_button: QPushButton | None = None
 
         self.metadata = QTextEdit(self)
         self.metadata.setReadOnly(True)
@@ -152,6 +165,7 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._connect_signals()
         self._sync_toolpath_view_modes_to_canvas()
+        self._sync_mirror_layer_controls()
         self._try_restore_last_project()
         self._update_window_title()
 
@@ -209,7 +223,33 @@ class MainWindow(QMainWindow):
         bar_layout.addStretch(1)
 
         root.addWidget(self.layers_activity_bar)
-        root.addWidget(self.layer_tree, 1)
+
+        content = QWidget(panel)
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(4)
+
+        action_row = QWidget(content)
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(4, 4, 4, 0)
+        action_layout.setSpacing(4)
+
+        self.mirror_layer_button = QPushButton("Mirror", action_row)
+        self.mirror_layer_button.setToolTip(
+            "Mirror loaded file layers around the board's vertical centreline"
+        )
+        self.mirror_layer_button.clicked.connect(self._toggle_loaded_layers_mirror_x)
+
+        self.reassign_layers_button = QPushButton("Roles...", action_row)
+        self.reassign_layers_button.setToolTip("Reassign layer types and roles")
+        self.reassign_layers_button.clicked.connect(self._reassign_layer_roles)
+
+        action_layout.addWidget(self.mirror_layer_button)
+        action_layout.addWidget(self.reassign_layers_button)
+        content_layout.addWidget(action_row)
+        content_layout.addWidget(self.layer_tree, 1)
+
+        root.addWidget(content, 1)
         return panel
 
     def _create_layers_activity_button(self, text: str, tooltip: str) -> QToolButton:
@@ -382,6 +422,14 @@ class MainWindow(QMainWindow):
         self.generate_centering_holes_action = QAction("Generate Centering Holes Toolpath", self)
         self.generate_hatching_toolpath_action = QAction("Generate Hatching Toolpath", self)
         self.generate_surfacing_toolpath_action = QAction("Generate Surfacing Toolpath", self)
+        self.mirror_layer_action = QAction("Mirror Loaded File Layers", self)
+        self.mirror_layer_action.setCheckable(True)
+        self.mirror_bottom_centering_action = QAction("Mirror Bottom Layer Using Centering Holes", self)
+        self.reassign_layer_roles_action = QAction("Reassign Layer Types/Roles...", self)
+        tools_menu.addAction(self.mirror_layer_action)
+        tools_menu.addAction(self.mirror_bottom_centering_action)
+        tools_menu.addAction(self.reassign_layer_roles_action)
+        tools_menu.addSeparator()
         tools_menu.addAction(self.generate_isolation_action)
         tools_menu.addAction(self.generate_hatching_toolpath_action)
         tools_menu.addAction(self.generate_cutout_toolpath_action)
@@ -515,6 +563,9 @@ class MainWindow(QMainWindow):
         self.drill_centerline_action.triggered.connect(lambda: self._on_drill_mode_action("centerline"))
         self.renderer_qt_action.triggered.connect(lambda: self._switch_renderer("qt"))
         self.renderer_pyqtgraph_action.triggered.connect(lambda: self._switch_renderer("pyqtgraph"))
+        self.mirror_layer_action.triggered.connect(self._toggle_loaded_layers_mirror_x)
+        self.mirror_bottom_centering_action.triggered.connect(self._toggle_bottom_layer_mirror_from_centering_holes)
+        self.reassign_layer_roles_action.triggered.connect(self._reassign_layer_roles)
         self.generate_isolation_action.triggered.connect(self._generate_isolation_geometry)
         self.generate_hatching_toolpath_action.triggered.connect(self._generate_hatching_toolpath)
         self.generate_cutout_toolpath_action.triggered.connect(self._open_cutout_planner)
@@ -526,6 +577,7 @@ class MainWindow(QMainWindow):
 
         self.layer_tree.itemChanged.connect(self._on_layer_item_changed)
         self.layer_tree.currentItemChanged.connect(self._on_layer_selected)
+        self.layer_tree.itemSelectionChanged.connect(self._sync_mirror_layer_controls)
         self.layer_tree.itemExpanded.connect(self._on_group_expand)
         self.layer_tree.itemCollapsed.connect(self._on_group_collapse)
 
@@ -629,6 +681,197 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage("Geometry debug dump disabled.", 2000)
 
+    def _loaded_layer_indices(self) -> list[int]:
+        return [
+            idx
+            for idx, layer in enumerate(self.project.layers)
+            if not self._is_generated_layer(layer)
+        ]
+
+    def _toggle_loaded_layers_mirror_x(self) -> None:
+        if self._task_running:
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
+            self._sync_mirror_layer_controls()
+            return
+        indices = self._loaded_layer_indices()
+        if not indices:
+            QMessageBox.information(self, "Mirror Layer", "Import one or more file layers first.")
+            self._sync_mirror_layer_controls()
+            return
+        bounds = self._combined_layer_bbox(indices, transformed=True)
+        if bounds is None:
+            QMessageBox.information(self, "Mirror Layer", "Could not determine loaded file bounds.")
+            self._sync_mirror_layer_controls()
+            return
+        axis_x = (bounds[0] + bounds[2]) * 0.5
+
+        # Horizontal mirroring is the common PCB flip used when milling a
+        # single-sided through-hole board from the underside. Adjust the
+        # offset so mirroring happens around the loaded board centreline.
+        target = any(not bool(self.project.layers[idx].mirror_x) for idx in indices)
+        for idx in indices:
+            layer = self.project.layers[idx]
+            layer.offset_x_mm = (2.0 * axis_x) - float(layer.offset_x_mm)
+            self.project.set_layer_mirror(idx, target, bool(layer.mirror_y))
+
+        if hasattr(self.canvas, "apply_layer_transform_updates"):
+            self.canvas.apply_layer_transform_updates(indices)
+        else:
+            self._refresh_canvas(fit=False)
+        self._fit_canvas_to_viewport()
+        self._clear_cutout_preview()
+        self._sync_mirror_layer_controls()
+        self._on_layer_selected(self.layer_tree.currentItem(), None)
+
+        names = ", ".join(self.project.layers[idx].name for idx in indices[:3])
+        if len(indices) > 3:
+            names += f", +{len(indices) - 3} more"
+        state = "Mirrored" if target else "Unmirrored"
+        self.statusBar().showMessage(
+            f"{state} loaded file layers around X={axis_x:.3f} mm: {names}",
+            4500,
+        )
+
+    def _toggle_bottom_layer_mirror_from_centering_holes(self) -> None:
+        if self._task_running:
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
+            self._sync_mirror_layer_controls()
+            return
+
+        axis = self._centering_hole_mirror_axis()
+        if axis is None:
+            QMessageBox.information(
+                self,
+                "Mirror Bottom Layer",
+                "Generate a centering holes toolpath first.",
+            )
+            self._sync_mirror_layer_controls()
+            return
+
+        indices = self._bottom_layer_indices()
+        if not indices:
+            QMessageBox.information(
+                self,
+                "Mirror Bottom Layer",
+                "Assign the imported bottom copper layer role first.",
+            )
+            self._sync_mirror_layer_controls()
+            return
+
+        mirror_attr, hole_axis_value = axis
+        board_bounds = self._bottom_mirror_board_bbox()
+        if board_bounds is None:
+            QMessageBox.information(
+                self,
+                "Mirror Bottom Layer",
+                "Could not determine the board bounds.",
+            )
+            self._sync_mirror_layer_controls()
+            return
+
+        if mirror_attr == "mirror_x":
+            axis_value = (board_bounds[0] + board_bounds[2]) * 0.5
+        else:
+            axis_value = (board_bounds[1] + board_bounds[3]) * 0.5
+        target = any(not bool(getattr(self.project.layers[idx], mirror_attr, False)) for idx in indices)
+        for idx in indices:
+            layer = self.project.layers[idx]
+            if mirror_attr == "mirror_x":
+                layer.offset_x_mm = (2.0 * axis_value) - float(layer.offset_x_mm)
+                self.project.set_layer_mirror(idx, target, bool(layer.mirror_y))
+            else:
+                layer.offset_y_mm = (2.0 * axis_value) - float(layer.offset_y_mm)
+                self.project.set_layer_mirror(idx, bool(layer.mirror_x), target)
+
+        if hasattr(self.canvas, "apply_layer_transform_updates"):
+            self.canvas.apply_layer_transform_updates(indices)
+        else:
+            self._refresh_canvas(fit=False)
+        self._fit_canvas_to_viewport()
+        self._clear_cutout_preview()
+        self._sync_mirror_layer_controls()
+        self._on_layer_selected(self.layer_tree.currentItem(), None)
+
+        axis_label = "X" if mirror_attr == "mirror_x" else "Y"
+        names = ", ".join(self.project.layers[idx].name for idx in indices[:3])
+        if len(indices) > 3:
+            names += f", +{len(indices) - 3} more"
+        state = "Mirrored" if target else "Unmirrored"
+        self.statusBar().showMessage(
+            (
+                f"{state} bottom layer inside board {axis_label}={axis_value:.3f} mm "
+                f"(centering holes at {axis_label}={hole_axis_value:.3f} mm): {names}"
+            ),
+            5000,
+        )
+
+    def _bottom_layer_indices(self) -> list[int]:
+        return [
+            idx
+            for idx, layer in enumerate(self.project.layers)
+            if not self._is_generated_layer(layer)
+            and str(getattr(layer, "role", "unassigned")).strip().lower() == "bottom"
+        ]
+
+    def _centering_hole_mirror_axis(self) -> tuple[str, float] | None:
+        for layer in reversed(self.project.layers):
+            axis = centering_hole_mirror_axis(layer)
+            if axis is not None:
+                return axis
+        return None
+
+    def _bottom_mirror_board_bbox(self) -> tuple[float, float, float, float] | None:
+        reference_indices = [
+            idx
+            for idx, layer in enumerate(self.project.layers)
+            if not self._is_generated_layer(layer)
+            and str(getattr(layer, "role", "unassigned")).strip().lower() in {"top", "cutout", "artwork"}
+        ]
+        if reference_indices:
+            bounds = self._combined_layer_bbox(reference_indices, transformed=True)
+            if bounds is not None:
+                return bounds
+
+        non_bottom_indices = [
+            idx
+            for idx, layer in enumerate(self.project.layers)
+            if not self._is_generated_layer(layer)
+            and str(getattr(layer, "role", "unassigned")).strip().lower() != "bottom"
+        ]
+        if non_bottom_indices:
+            bounds = self._combined_layer_bbox(non_bottom_indices, transformed=True)
+            if bounds is not None:
+                return bounds
+
+        return self._combined_layer_bbox(self._bottom_layer_indices(), transformed=True)
+
+    def _sync_mirror_layer_controls(self) -> None:
+        indices = self._loaded_layer_indices()
+        enabled = bool(indices) and not self._task_running
+        checked = bool(indices) and all(bool(self.project.layers[idx].mirror_x) for idx in indices)
+        text = "Unmirror" if checked else "Mirror"
+        if hasattr(self, "mirror_layer_action"):
+            self.mirror_layer_action.blockSignals(True)
+            self.mirror_layer_action.setEnabled(enabled)
+            self.mirror_layer_action.setChecked(checked)
+            self.mirror_layer_action.setText(
+                "Unmirror Loaded File Layers" if checked else "Mirror Loaded File Layers"
+            )
+            self.mirror_layer_action.blockSignals(False)
+        if self.mirror_layer_button is not None:
+            self.mirror_layer_button.setEnabled(enabled)
+            self.mirror_layer_button.setText(text)
+        if hasattr(self, "mirror_bottom_centering_action"):
+            self.mirror_bottom_centering_action.setEnabled(
+                bool(self._bottom_layer_indices())
+                and self._centering_hole_mirror_axis() is not None
+                and not self._task_running
+            )
+        if hasattr(self, "reassign_layer_roles_action"):
+            self.reassign_layer_roles_action.setEnabled(enabled)
+        if self.reassign_layers_button is not None:
+            self.reassign_layers_button.setEnabled(enabled)
+
     def _open_tool_library(self) -> None:
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
@@ -659,7 +902,7 @@ class MainWindow(QMainWindow):
             self,
             "Open Gerber Files",
             "",
-            "Gerber Files (*.gtl *.gbl *.gto *.gbo *.gts *.gbs *.gko *.gm1 *.gbr *.pho *.art);;All Files (*)",
+            "Gerber Files (*.gtl *.gbl *.gto *.gbo *.gts *.gbs *.gko *.gm1 *.gb0 *.gb1 *.gb2 *.gb3 *.gb4 *.gb5 *.gb6 *.gb7 *.gb8 *.gb9 *.gbr *.pho *.art);;All Files (*)",
         )
         self._import_paths([Path(p) for p in paths])
 
@@ -689,15 +932,109 @@ class MainWindow(QMainWindow):
         if not paths:
             return
         try:
-            import_files(paths, self.project)
+            imported_layers = import_files(paths, self.project)
         except Exception as exc:
             LOGGER.exception("Import failed")
             QMessageBox.warning(self, "Import Failed", str(exc))
             return
+        self._assign_roles_for_imported_layers(imported_layers)
         self._rebuild_scene()
         self._project_file_path = None
         self._update_window_title()
         self.statusBar().showMessage(f"Imported {len(paths)} file(s)", 3000)
+
+    def _assign_roles_for_imported_layers(self, layers: list[Layer]) -> None:
+        if not layers:
+            return
+        first_index = len(self.project.layers) - len(layers)
+        entries: list[LayerRoleEntry] = []
+        for offset, layer in enumerate(layers):
+            layer_index = first_index + offset
+            if layer_index < 0 or layer_index >= len(self.project.layers):
+                continue
+            entries.append(
+                LayerRoleEntry(
+                    layer_index=layer_index,
+                    name=str(layer.name),
+                    kind=str(layer.kind),
+                    path=str(layer.path),
+                    role=str(layer.role),
+                )
+            )
+        if not entries:
+            return
+        dlg = LayerRolesDialog(entries, self, title="Assign Roles For Imported Files")
+        if dlg.exec() != QDialog.Accepted:
+            return
+        selected_roles = dlg.selected_roles()
+        selected_kinds = dlg.selected_kinds()
+        for layer_index in sorted(set(selected_roles) | set(selected_kinds)):
+            if layer_index < 0 or layer_index >= len(self.project.layers):
+                continue
+            self._apply_layer_kind(layer_index, selected_kinds.get(layer_index, ""))
+            self._apply_layer_role(layer_index, selected_roles.get(layer_index, ""))
+
+    def _reassign_layer_roles(self) -> None:
+        if self._task_running:
+            QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
+            return
+        indices = self._loaded_layer_indices()
+        if not indices:
+            QMessageBox.information(self, "Layer Roles", "Import one or more file layers first.")
+            return
+        entries = [
+            LayerRoleEntry(
+                layer_index=idx,
+                name=str(self.project.layers[idx].name),
+                kind=str(self.project.layers[idx].kind),
+                path=str(self.project.layers[idx].path),
+                role=str(self.project.layers[idx].role),
+            )
+            for idx in indices
+        ]
+        dlg = LayerRolesDialog(entries, self, title="Reassign Layer Types/Roles")
+        if dlg.exec() != QDialog.Accepted:
+            return
+        selected_roles = dlg.selected_roles()
+        selected_kinds = dlg.selected_kinds()
+        changed_indices: list[int] = []
+        for layer_index in sorted(set(selected_roles) | set(selected_kinds)):
+            if layer_index < 0 or layer_index >= len(self.project.layers):
+                continue
+            before = (
+                str(self.project.layers[layer_index].kind),
+                str(self.project.layers[layer_index].role),
+            )
+            self._apply_layer_kind(layer_index, selected_kinds.get(layer_index, ""))
+            self._apply_layer_role(layer_index, selected_roles.get(layer_index, ""))
+            after = (
+                str(self.project.layers[layer_index].kind),
+                str(self.project.layers[layer_index].role),
+            )
+            if after != before:
+                changed_indices.append(layer_index)
+        self._rebuild_scene()
+        if changed_indices:
+            self.statusBar().showMessage(f"Updated {len(changed_indices)} layer assignment(s)", 3000)
+        else:
+            self.statusBar().showMessage("Layer assignments unchanged", 2000)
+
+    def _apply_layer_kind(self, layer_index: int, kind: str) -> None:
+        normalized = str(kind or "").strip().lower()
+        if normalized not in {"gerber", "excellon", "geometry"}:
+            return
+        layer = self.project.layers[layer_index]
+        layer.kind = normalized
+        layer.metadata["kind"] = normalized
+
+    def _apply_layer_role(self, layer_index: int, role: str) -> None:
+        if not role:
+            return
+        self.project.set_layer_role(layer_index, role)
+        layer = self.project.layers[layer_index]
+        style = ROLE_DEFAULT_STYLE.get(str(layer.role))
+        if style is not None:
+            layer.color, layer.opacity = style
 
     def _open_project_file(self) -> None:
         if self._task_running:
@@ -910,6 +1247,7 @@ class MainWindow(QMainWindow):
             "centering_hole_diameter_mm": 0.0,
             "centering_extra_depth_mm": 0.0,
             "drill_use_single_tool_boring": False,
+            "drill_allow_oversize_tool_for_small_holes": False,
             "drill_single_tool_slot": None,
             "drill_use_closest_smaller_boring": False,
             "drill_use_closest_greater_no_boring": False,
@@ -953,6 +1291,9 @@ class MainWindow(QMainWindow):
         out["centering_hole_diameter_mm"] = self._safe_float(data.get("centering_hole_diameter_mm"), 0.0)
         out["centering_extra_depth_mm"] = self._safe_float(data.get("centering_extra_depth_mm"), 0.0)
         out["drill_use_single_tool_boring"] = bool(data.get("drill_use_single_tool_boring", False))
+        out["drill_allow_oversize_tool_for_small_holes"] = bool(
+            data.get("drill_allow_oversize_tool_for_small_holes", False)
+        )
         single_slot = data.get("drill_single_tool_slot")
         out["drill_single_tool_slot"] = int(single_slot) if isinstance(single_slot, int) else None
         out["drill_use_closest_smaller_boring"] = bool(data.get("drill_use_closest_smaller_boring", False))
@@ -996,6 +1337,9 @@ class MainWindow(QMainWindow):
             "centering_hole_diameter_mm": float(self._selected_tools_assignments.get("centering_hole_diameter_mm", 0.0)),
             "centering_extra_depth_mm": float(self._selected_tools_assignments.get("centering_extra_depth_mm", 0.0)),
             "drill_use_single_tool_boring": bool(self._selected_tools_assignments.get("drill_use_single_tool_boring", False)),
+            "drill_allow_oversize_tool_for_small_holes": bool(
+                self._selected_tools_assignments.get("drill_allow_oversize_tool_for_small_holes", False)
+            ),
             "drill_single_tool_slot": self._selected_tools_assignments.get("drill_single_tool_slot"),
             "drill_use_closest_smaller_boring": bool(
                 self._selected_tools_assignments.get("drill_use_closest_smaller_boring", False)
@@ -1084,6 +1428,7 @@ class MainWindow(QMainWindow):
         self.canvas.clear_scene()
         self.scene_items.clear()
         self._update_window_title()
+        self._sync_mirror_layer_controls()
 
     def _rebuild_scene(self) -> None:
         self._refresh_canvas(fit=True)
@@ -1101,7 +1446,7 @@ class MainWindow(QMainWindow):
         if self._cutout_plan_active:
             if self._cutout_preview_locked_until_reopen:
                 self._clear_cutout_preview()
-            elif self._has_generated_cutout_toolpath(source_layer_index=self._cutout_plan_source_layer_index):
+            elif self._has_generated_cutout_toolpath(source_layer_indices=self._active_cutout_source_indices()):
                 # Keep preview locked out while generated cutout output exists.
                 self._cutout_preview_locked_until_reopen = True
                 self._clear_cutout_preview()
@@ -1147,6 +1492,7 @@ class MainWindow(QMainWindow):
         generated_group.setExpanded(self._generated_group_expanded)
 
         self.layer_tree.blockSignals(False)
+        self._sync_mirror_layer_controls()
 
     def _on_layer_item_changed(self, item: QTreeWidgetItem, column: int) -> None:  # noqa: ARG002
         layer_index = self._layer_index_from_item(item)
@@ -1187,6 +1533,11 @@ class MainWindow(QMainWindow):
             f"path: {layer.path}",
             f"visible: {layer.visible}",
             f"role: {layer.role}",
+            f"offset_x_mm: {layer.offset_x_mm:.6f}",
+            f"offset_y_mm: {layer.offset_y_mm:.6f}",
+            f"rotation_deg: {layer.rotation_deg:.6f}",
+            f"mirror_x: {layer.mirror_x}",
+            f"mirror_y: {layer.mirror_y}",
         ]
         for k, v in sorted(layer.metadata.items()):
             lines.append(f"{k}: {v}")
@@ -1310,16 +1661,17 @@ class MainWindow(QMainWindow):
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
             return
-        index = self._current_layer_index()
-        if index is None or index < 0 or index >= len(self.project.layers):
+        source_layers = self._selected_layers_for_operation()
+        if not source_layers:
             QMessageBox.information(self, "Isolation", "Select a Gerber layer first.")
             return
 
-        source_layer = self.project.layers[index]
-        source_name = source_layer.name
-        if source_layer.kind != "gerber":
+        invalid_layers = [layer.name for layer in source_layers if layer.kind != "gerber"]
+        if invalid_layers:
             QMessageBox.information(self, "Isolation", "Isolation currently supports Gerber layers only.")
             return
+        source_layer = source_layers[0]
+        source_name = self._source_layers_label(source_layers)
 
         engraving_tool = self._selected_engraving_tool()
         if engraving_tool is None:
@@ -1413,9 +1765,10 @@ class MainWindow(QMainWindow):
 
         self._run_process_task(
             title=f"Isolation {source_name}",
-            task_name="isolation_generate",
+            task_name="isolation_generate_multi" if len(source_layers) > 1 else "isolation_generate",
             payload={
                 "source_layer": serialize_layer(source_layer),
+                "source_layers": [serialize_layer(layer) for layer in source_layers],
                 "params": isolation_params_payload(params),
             },
             decode_result=lambda data: deserialize_layer(dict(data["generated_layer"])),
@@ -1427,17 +1780,21 @@ class MainWindow(QMainWindow):
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
             return
-        index = self._current_layer_index()
-        if index is None or index < 0 or index >= len(self.project.layers):
+        source_layers = self._selected_layers_for_operation()
+        if not source_layers:
             QMessageBox.information(self, "Hatching Toolpath", "Select a top/bottom copper Gerber layer first.")
             return
 
-        source_layer = self.project.layers[index]
-        source_name = source_layer.name
-        if source_layer.kind != "gerber":
+        source_layer = source_layers[0]
+        source_name = self._source_layers_label(source_layers)
+        if any(layer.kind != "gerber" for layer in source_layers):
             QMessageBox.information(self, "Hatching Toolpath", "Hatching currently supports Gerber copper layers only.")
             return
-        if str(getattr(source_layer, "role", "unassigned")).strip().lower() not in {"top", "bottom", "artwork", "unassigned"}:
+        if any(
+            str(getattr(layer, "role", "unassigned")).strip().lower()
+            not in {"top", "bottom", "artwork", "unassigned"}
+            for layer in source_layers
+        ):
             QMessageBox.information(
                 self,
                 "Hatching Toolpath",
@@ -1508,17 +1865,19 @@ class MainWindow(QMainWindow):
             boundary_margin_mm=float(boundary_margin),
         )
 
+        source_layer_ids = {id(layer) for layer in source_layers}
         keepout_layers = [
             layer
             for layer in self.project.layers
-            if layer is not source_layer
+            if id(layer) not in source_layer_ids
             and str(layer.metadata.get("kind", "")).strip().lower()
-            in {"isolation_toolpath", "cutout_toolpath", "drill_toolpath", "centering_holes_toolpath"}
+            in {"isolation", "isolation_toolpath"}
+            and self._layer_is_derived_from_any(layer, source_layers)
         ]
         board_layers = [
             layer
             for layer in self.project.layers
-            if layer is not source_layer
+            if id(layer) not in source_layer_ids
             and str(getattr(layer, "role", "unassigned")).strip().lower() == "cutout"
             and layer.kind in {"gerber", "geometry"}
         ]
@@ -1544,12 +1903,14 @@ class MainWindow(QMainWindow):
 
         self._run_process_task(
             title=f"Hatching Toolpath {source_name}",
-            task_name="hatching_generate",
+            task_name="hatching_generate_multi" if len(source_layers) > 1 else "hatching_generate",
             payload={
                 "source_layer": serialize_layer(source_layer),
+                "source_layers": [serialize_layer(layer) for layer in source_layers],
                 "params": hatching_params_payload(params),
                 "keepout_layers": [serialize_layer(layer) for layer in keepout_layers],
                 "board_layers": [serialize_layer(layer) for layer in board_layers],
+                "copper_keepout_layers": [serialize_layer(layer) for layer in source_layers],
             },
             decode_result=lambda data: deserialize_layer(dict(data["generated_layer"])),
             on_success=on_done,
@@ -1560,14 +1921,14 @@ class MainWindow(QMainWindow):
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
             return
-        index = self._current_layer_index()
-        if index is None or index < 0 or index >= len(self.project.layers):
+        source_layers = self._selected_layers_for_operation()
+        if not source_layers:
             QMessageBox.information(self, "Drill Toolpath", "Select an Excellon layer first.")
             return
 
-        source_layer = self.project.layers[index]
-        source_name = source_layer.name
-        if source_layer.kind != "excellon":
+        source_layer = source_layers[0]
+        source_name = self._source_layers_label(source_layers)
+        if any(layer.kind != "excellon" for layer in source_layers):
             QMessageBox.information(self, "Drill Toolpath", "Drill toolpath currently supports Excellon layers only.")
             return
 
@@ -1599,6 +1960,9 @@ class MainWindow(QMainWindow):
             boring_cycle_mode=cycle_mode,
             drilling_depth_mm=max(0.0, self._safe_float(self._selected_tools_assignments.get("drill_depth_mm"), 0.0)),
             boring_speed_mm_s=max(0.0, self._safe_float(self._selected_tools_assignments.get("drill_boring_speed_mm_s"), 0.0)),
+            allow_oversize_tool_for_small_holes=bool(
+                self._selected_tools_assignments.get("drill_allow_oversize_tool_for_small_holes", False)
+            ),
         )
 
         def on_done(layer):
@@ -1626,6 +1990,13 @@ class MainWindow(QMainWindow):
                         "Choose a smaller drill tool in Strategy A for those holes."
                     ),
                 )
+            oversize = self._safe_int(layer.metadata.get("drill_oversize_small_holes"), 0)
+            if oversize > 0:
+                QMessageBox.information(
+                    self,
+                    "Drill Toolpath",
+                    f"{oversize} hole(s) smaller than the selected drill tool will be drilled oversize.",
+                )
             self.statusBar().showMessage(
                 f"Drill toolpath generated from '{source_name}' using tool {tool_label}",
                 4500,
@@ -1633,9 +2004,10 @@ class MainWindow(QMainWindow):
 
         self._run_process_task(
             title=f"Drill Toolpath {source_name}",
-            task_name="drill_generate",
+            task_name="drill_generate_multi" if len(source_layers) > 1 else "drill_generate",
             payload={
                 "source_layer": serialize_layer(source_layer),
+                "source_layers": [serialize_layer(layer) for layer in source_layers],
                 "params": drill_params_payload(params),
             },
             decode_result=lambda data: deserialize_layer(dict(data["generated_layer"])),
@@ -1735,7 +2107,7 @@ class MainWindow(QMainWindow):
 
         default_bounds = None
         if selected_layer is not None:
-            default_bounds = self._layer_bbox_or_none(selected_layer)
+            default_bounds = self._layer_bbox_or_none(selected_layer, transformed=True)
         if default_bounds is None:
             default_bounds = self._imported_board_bbox()
         if default_bounds is None:
@@ -1812,12 +2184,12 @@ class MainWindow(QMainWindow):
         *,
         fallback: tuple[float, float, float, float] = (0.0, 0.0, 100.0, 100.0),
     ) -> tuple[float, float, float, float]:
-        out = self._layer_bbox_or_none(layer)
+        out = self._layer_bbox_or_none(layer, transformed=True)
         if out is not None:
             return out
         return fallback
 
-    def _layer_bbox_or_none(self, layer) -> tuple[float, float, float, float] | None:
+    def _layer_bbox_or_none(self, layer, *, transformed: bool = False) -> tuple[float, float, float, float] | None:
         bbox = getattr(layer, "bbox", None)
         if isinstance(bbox, tuple) and len(bbox) == 4:
             try:
@@ -1826,7 +2198,8 @@ class MainWindow(QMainWindow):
                 max_x = float(bbox[2])
                 max_y = float(bbox[3])
                 if (max_x - min_x) > 1e-9 and (max_y - min_y) > 1e-9:
-                    return min_x, min_y, max_x, max_y
+                    out = (min_x, min_y, max_x, max_y)
+                    return self._transform_layer_bbox(layer, out) if transformed else out
             except Exception:
                 pass
 
@@ -1839,10 +2212,70 @@ class MainWindow(QMainWindow):
                 min_y = float(min(y_pair[0], y_pair[1]))
                 max_y = float(max(y_pair[0], y_pair[1]))
                 if (max_x - min_x) > 1e-9 and (max_y - min_y) > 1e-9:
-                    return min_x, min_y, max_x, max_y
+                    out = (min_x, min_y, max_x, max_y)
+                    return self._transform_layer_bbox(layer, out) if transformed else out
             except Exception:
                 pass
         return None
+
+    def _combined_layer_bbox(
+        self,
+        layer_indices: list[int],
+        *,
+        transformed: bool,
+    ) -> tuple[float, float, float, float] | None:
+        min_x = float("inf")
+        min_y = float("inf")
+        max_x = float("-inf")
+        max_y = float("-inf")
+        found = False
+        for idx in layer_indices:
+            if idx < 0 or idx >= len(self.project.layers):
+                continue
+            layer = self.project.layers[idx]
+            bbox = self._layer_bbox_or_none(layer, transformed=transformed)
+            if bbox is None:
+                continue
+            bx0, by0, bx1, by1 = bbox
+            min_x = min(min_x, bx0)
+            min_y = min(min_y, by0)
+            max_x = max(max_x, bx1)
+            max_y = max(max_y, by1)
+            found = True
+        if not found:
+            return None
+        return min_x, min_y, max_x, max_y
+
+    @staticmethod
+    def _transform_layer_bbox(
+        layer,
+        bbox: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        min_x, min_y, max_x, max_y = bbox
+        sx = -1.0 if bool(getattr(layer, "mirror_x", False)) else 1.0
+        sy = -1.0 if bool(getattr(layer, "mirror_y", False)) else 1.0
+        rot = math.radians(float(getattr(layer, "rotation_deg", 0.0) or 0.0))
+        cr = math.cos(rot)
+        sr = math.sin(rot)
+        tx = float(getattr(layer, "offset_x_mm", 0.0) or 0.0)
+        ty = float(getattr(layer, "offset_y_mm", 0.0) or 0.0)
+
+        points: list[tuple[float, float]] = []
+        for x, y in (
+            (min_x, min_y),
+            (min_x, max_y),
+            (max_x, min_y),
+            (max_x, max_y),
+        ):
+            mx = float(x) * sx
+            my = float(y) * sy
+            rx = mx * cr - my * sr
+            ry = mx * sr + my * cr
+            points.append((rx + tx, ry + ty))
+
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        return min(xs), min(ys), max(xs), max(ys)
 
     def _imported_board_bbox(self) -> tuple[float, float, float, float] | None:
         preferred = self._imported_bbox_for_roles({"top", "bottom", "cutout", "artwork"})
@@ -1862,7 +2295,7 @@ class MainWindow(QMainWindow):
             role = str(getattr(layer, "role", "unassigned")).strip().lower()
             if roles is not None and role not in roles:
                 continue
-            bbox = self._layer_bbox_or_none(layer)
+            bbox = self._layer_bbox_or_none(layer, transformed=True)
             if bbox is None:
                 continue
             bx0, by0, bx1, by1 = bbox
@@ -1874,6 +2307,34 @@ class MainWindow(QMainWindow):
         if not found:
             return None
         return min_x, min_y, max_x, max_y
+
+    @staticmethod
+    def _layer_is_derived_from(layer, source_layer) -> bool:  # noqa: ANN001
+        meta = getattr(layer, "metadata", {}) or {}
+        source_name = str(getattr(source_layer, "name", "") or "").strip()
+        derived_names = {
+            part.strip()
+            for part in str(meta.get("derived_from", "")).split(",")
+            if part.strip()
+        }
+        if source_name and source_name in derived_names:
+            return True
+        derived_path = str(meta.get("path", "")).strip()
+        source_path = str(getattr(source_layer, "path", "") or "").strip()
+        return bool(derived_path and source_path and derived_path == source_path)
+
+    def _layer_is_derived_from_any(self, layer, source_layers: list[Layer]) -> bool:  # noqa: ANN001
+        return any(self._layer_is_derived_from(layer, source_layer) for source_layer in source_layers)
+
+    @staticmethod
+    def _source_layers_label(source_layers: list[Layer]) -> str:
+        names = [str(getattr(layer, "name", "") or "").strip() for layer in source_layers]
+        names = [name for name in names if name]
+        if not names:
+            return "selected layers"
+        if len(names) <= 2:
+            return ", ".join(names)
+        return f"{names[0]}, {names[1]}, +{len(names) - 2} more"
 
     def _first_reference_layer(self, *, default_bounds: tuple[float, float, float, float]) -> Layer:
         for layer in self.project.layers:
@@ -2021,7 +2482,7 @@ class MainWindow(QMainWindow):
         if not self._cutout_plan_active:
             self._update_cutout_preview_state_hint()
             return
-        if self._has_generated_cutout_toolpath(source_layer_index=self._cutout_plan_source_layer_index):
+        if self._has_generated_cutout_toolpath(source_layer_indices=self._active_cutout_source_indices()):
             # Keep lock armed while a generated cutout layer still exists.
             self._clear_cutout_preview()
             self._update_cutout_preview_state_hint()
@@ -2038,27 +2499,27 @@ class MainWindow(QMainWindow):
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
             return
-        index = self._current_layer_index()
-        if index is None or index < 0 or index >= len(self.project.layers):
+        source_indices = self._selected_layer_indices()
+        if not source_indices:
             QMessageBox.information(self, "Cutout Toolpath", "Select a cutout/gerber layer first.")
             return
 
-        source_layer = self.project.layers[index]
-        if source_layer.role != "cutout":
+        source_layers = [self.project.layers[idx] for idx in source_indices]
+        if any(layer.role != "cutout" for layer in source_layers):
             QMessageBox.information(
                 self,
                 "Cutout Toolpath",
                 "Cutout toolpath can be generated only from a layer with role 'cutout'.",
             )
             return
-        if source_layer.kind not in {"gerber", "geometry"}:
+        if any(layer.kind not in {"gerber", "geometry"} for layer in source_layers):
             QMessageBox.information(self, "Cutout Toolpath", "Cutout toolpath currently supports Gerber/geometry layers.")
             return
 
-        # Fast reopen path: preserve cached loop extraction for same source layer.
+        # Fast reopen path: preserve cached loop extraction for same source layers.
         if (
             self._cutout_plan_active
-            and self._cutout_plan_source_layer_index == index
+            and self._active_cutout_source_indices() == source_indices
             and bool(self._cutout_plan_loops)
         ):
             was_hidden = not bool(self.cutout_dock.isVisible())
@@ -2073,16 +2534,20 @@ class MainWindow(QMainWindow):
                 self._apply_cutout_preview_layer()
             return
 
-        source_name = source_layer.name
+        source_name = self._source_layers_label(source_layers)
 
-        def on_done(loops):
+        def on_done(loop_items):
+            loops = [item[0] for item in loop_items]
+            loop_sources = [int(item[1]) for item in loop_items]
             if not loops:
-                QMessageBox.warning(self, "Cutout Toolpath Failed", "No closed loops were found in this cutout layer.")
+                QMessageBox.warning(self, "Cutout Toolpath Failed", "No closed loops were found in the selected cutout layer(s).")
                 return
             self._cutout_preview_locked_until_reopen = False
             self._cutout_plan_active = True
-            self._cutout_plan_source_layer_index = index
+            self._cutout_plan_source_layer_index = source_indices[0]
+            self._cutout_plan_source_layer_indices = list(source_indices)
             self._cutout_plan_loops = loops
+            self._cutout_plan_loop_source_positions = loop_sources
             self._cutout_plan_compensations = self._default_cutout_loop_compensations(loops)
             self._sync_cutout_tool_controls()
             self._populate_cutout_table()
@@ -2101,13 +2566,16 @@ class MainWindow(QMainWindow):
                 for ring in item.get("interiors", []) or []:
                     interiors.append([(float(p[0]), float(p[1])) for p in ring])
                 if len(ext) >= 3:
-                    decoded.append(Polygon(ext, interiors))
+                    decoded.append((Polygon(ext, interiors), int(item.get("source_pos", 0))))
             return decoded
 
         self._run_process_task(
             title=f"Cutout Loop Extraction {source_name}",
-            task_name="cutout_extract_loops",
-            payload={"source_layer": serialize_layer(source_layer)},
+            task_name="cutout_extract_loops_multi" if len(source_layers) > 1 else "cutout_extract_loops",
+            payload={
+                "source_layer": serialize_layer(source_layers[0]),
+                "source_layers": [serialize_layer(layer) for layer in source_layers],
+            },
             decode_result=decode_loops,
             on_success=on_done,
             failure_title="Cutout Toolpath Failed",
@@ -2117,21 +2585,24 @@ class MainWindow(QMainWindow):
         if self._task_running:
             QMessageBox.information(self, "Busy", "Wait for the current task to finish.")
             return
-        if not self._cutout_plan_active or self._cutout_plan_source_layer_index is None:
+        source_indices = self._active_cutout_source_indices()
+        if not self._cutout_plan_active or not source_indices:
             return
         self._cancel_cutout_preview_task(clear_pending=True, clear_cache=False)
-        idx = self._cutout_plan_source_layer_index
-        if idx < 0 or idx >= len(self.project.layers):
+        if any(idx < 0 or idx >= len(self.project.layers) for idx in source_indices):
             return
-        source_layer = self.project.layers[idx]
+        source_layers = [self.project.layers[idx] for idx in source_indices]
         cutting_tool = self._selected_cutting_tool()
         tool_dia = self._active_cutout_tool_diameter_mm()
         params = CutoutParams(
             tool_diameter_mm=tool_dia,
             compensation="outside",
             loop_compensations=list(self._cutout_plan_compensations),
+            holding_tab_count=int(self.cutout_tab_count_spin.value()),
+            holding_tab_width_mm=float(self.cutout_tab_width_spin.value()),
         )
-        source_name = source_layer.name
+        source_name = self._source_layers_label(source_layers)
+        comps_by_layer = self._cutout_loop_compensations_by_source(len(source_layers))
 
         def on_done(layer):
             self._cutout_preview_locked_until_reopen = True
@@ -2167,10 +2638,12 @@ class MainWindow(QMainWindow):
 
         self._run_process_task(
             title=f"Cutout Toolpath {source_name}",
-            task_name="cutout_generate",
+            task_name="cutout_generate_multi" if len(source_layers) > 1 else "cutout_generate",
             payload={
-                "source_layer": serialize_layer(source_layer),
+                "source_layer": serialize_layer(source_layers[0]),
+                "source_layers": [serialize_layer(layer) for layer in source_layers],
                 "params": cutout_params_payload(params),
+                "loop_compensations_by_layer": comps_by_layer,
             },
             decode_result=lambda data: deserialize_layer(dict(data["generated_layer"])),
             on_success=on_done,
@@ -2187,7 +2660,9 @@ class MainWindow(QMainWindow):
         self._cutout_preview_locked_until_reopen = False
         self._cutout_plan_active = False
         self._cutout_plan_source_layer_index = None
+        self._cutout_plan_source_layer_indices = []
         self._cutout_plan_loops = []
+        self._cutout_plan_loop_source_positions = []
         self._cutout_plan_compensations = []
         self.cutout_loop_table.setRowCount(0)
         self.cutout_source_label.setText("Source: (none)")
@@ -2266,20 +2741,15 @@ class MainWindow(QMainWindow):
         layer_kind = str(layer_meta.get("kind", "")).strip().lower()
         layer_is_preview = str(layer_meta.get("preview", "")).strip().lower() in {"1", "true", "yes", "on"}
         layer_derived_from = str(layer_meta.get("derived_from", "")).strip()
-        active_source_name = None
-        if (
-            self._cutout_plan_active
-            and self._cutout_plan_source_layer_index is not None
-            and 0 <= int(self._cutout_plan_source_layer_index) < len(self.project.layers)
-        ):
-            active_source_name = str(self.project.layers[int(self._cutout_plan_source_layer_index)].name)
+        active_source_names = self._active_cutout_source_names()
+        derived_names = {part.strip() for part in layer_derived_from.split(",") if part.strip()}
         deleting_active_generated_cutout = bool(
             layer_kind == "cutout_toolpath"
             and not layer_is_preview
             and (
-                active_source_name is None
+                not active_source_names
                 or not layer_derived_from
-                or layer_derived_from == active_source_name
+                or bool(derived_names & set(active_source_names))
             )
         )
         answer = QMessageBox.question(
@@ -2301,6 +2771,14 @@ class MainWindow(QMainWindow):
                 self._reset_cutout_planner(refresh_canvas=False)
             elif self._cutout_plan_source_layer_index > layer_index:
                 self._cutout_plan_source_layer_index -= 1
+        if self._cutout_plan_source_layer_indices:
+            if layer_index in self._cutout_plan_source_layer_indices:
+                self._reset_cutout_planner(refresh_canvas=False)
+            else:
+                self._cutout_plan_source_layer_indices = [
+                    idx - 1 if idx > layer_index else idx
+                    for idx in self._cutout_plan_source_layer_indices
+                ]
         self._rebuild_scene()
         if self.project.layers:
             self._select_layer_item(min(layer_index, len(self.project.layers) - 1))
@@ -2319,6 +2797,57 @@ class MainWindow(QMainWindow):
 
     def _current_layer_index(self) -> int | None:
         return self._layer_index_from_item(self.layer_tree.currentItem())
+
+    def _selected_layer_indices(self) -> list[int]:
+        indices: list[int] = []
+        seen: set[int] = set()
+        for item in self.layer_tree.selectedItems():
+            idx = self._layer_index_from_item(item)
+            if idx is None or idx in seen:
+                continue
+            if 0 <= idx < len(self.project.layers):
+                indices.append(idx)
+                seen.add(idx)
+        current = self._current_layer_index()
+        if not indices and current is not None and 0 <= current < len(self.project.layers):
+            indices.append(current)
+        return indices
+
+    def _selected_layers_for_operation(self) -> list[Layer]:
+        return [self.project.layers[idx] for idx in self._selected_layer_indices()]
+
+    def _active_cutout_source_indices(self) -> list[int]:
+        indices = list(getattr(self, "_cutout_plan_source_layer_indices", []) or [])
+        if indices:
+            return [idx for idx in indices if 0 <= idx < len(self.project.layers)]
+        idx = self._cutout_plan_source_layer_index
+        if idx is not None and 0 <= int(idx) < len(self.project.layers):
+            return [int(idx)]
+        return []
+
+    def _active_cutout_source_names(self) -> list[str]:
+        return [str(self.project.layers[idx].name) for idx in self._active_cutout_source_indices()]
+
+    def _cutout_loop_compensations_by_source(self, source_count: int) -> list[list[str]]:
+        grouped: list[list[str]] = [[] for _ in range(max(0, int(source_count)))]
+        positions = list(getattr(self, "_cutout_plan_loop_source_positions", []) or [])
+        if len(positions) != len(self._cutout_plan_compensations):
+            positions = [0 for _ in self._cutout_plan_compensations]
+        for comp, source_pos in zip(self._cutout_plan_compensations, positions):
+            if 0 <= int(source_pos) < len(grouped):
+                grouped[int(source_pos)].append(str(comp))
+        return grouped
+
+    def _cutout_loop_source_name(self, loop_row: int) -> str:
+        positions = list(getattr(self, "_cutout_plan_loop_source_positions", []) or [])
+        source_indices = self._active_cutout_source_indices()
+        if 0 <= loop_row < len(positions):
+            source_pos = int(positions[loop_row])
+            if 0 <= source_pos < len(source_indices):
+                return str(self.project.layers[source_indices[source_pos]].name)
+        if source_indices:
+            return str(self.project.layers[source_indices[0]].name)
+        return ""
 
     def _select_layer_item(self, layer_index: int) -> None:
         item = self._layer_index_to_item.get(layer_index)
@@ -2447,13 +2976,38 @@ class MainWindow(QMainWindow):
         self.cutout_tool_dia_spin.valueChanged.connect(self._on_cutout_setting_changed)
         layout.addWidget(self.cutout_tool_dia_spin)
 
+        self.cutout_tabs_group = QGroupBox("Holding Breaks", panel)
+        tabs_layout = QHBoxLayout(self.cutout_tabs_group)
+        tabs_layout.setContentsMargins(8, 8, 8, 8)
+        tabs_layout.setSpacing(6)
+
+        self.cutout_tab_count_spin = QSpinBox(self.cutout_tabs_group)
+        self.cutout_tab_count_spin.setRange(0, 64)
+        self.cutout_tab_count_spin.setValue(0)
+        self.cutout_tab_count_spin.setPrefix("Count: ")
+        self.cutout_tab_count_spin.setToolTip("Number of uncut holding breaks to leave around each cutout loop")
+        self.cutout_tab_count_spin.valueChanged.connect(self._on_cutout_setting_changed)
+
+        self.cutout_tab_width_spin = QDoubleSpinBox(self.cutout_tabs_group)
+        self.cutout_tab_width_spin.setDecimals(3)
+        self.cutout_tab_width_spin.setRange(0.001, 1000.0)
+        self.cutout_tab_width_spin.setValue(1.0)
+        self.cutout_tab_width_spin.setPrefix("Width (mm): ")
+        self.cutout_tab_width_spin.setToolTip("Length of each uncut holding break along the cutout path")
+        self.cutout_tab_width_spin.valueChanged.connect(self._on_cutout_setting_changed)
+
+        tabs_layout.addWidget(self.cutout_tab_count_spin)
+        tabs_layout.addWidget(self.cutout_tab_width_spin)
+        layout.addWidget(self.cutout_tabs_group)
+
         self.cutout_loop_table = QTableWidget(panel)
-        self.cutout_loop_table.setColumnCount(3)
-        self.cutout_loop_table.setHorizontalHeaderLabels(["Loop", "Area (mm^2)", "Comp"])
+        self.cutout_loop_table.setColumnCount(4)
+        self.cutout_loop_table.setHorizontalHeaderLabels(["Loop", "Source", "Area (mm^2)", "Comp"])
         self.cutout_loop_table.verticalHeader().setVisible(False)
         self.cutout_loop_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.cutout_loop_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.cutout_loop_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.cutout_loop_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.cutout_loop_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
         self.cutout_loop_table.itemSelectionChanged.connect(self._refresh_canvas_no_fit)
         layout.addWidget(self.cutout_loop_table, 1)
 
@@ -2473,6 +3027,8 @@ class MainWindow(QMainWindow):
         for row, loop in enumerate(self._cutout_plan_loops):
             idx_item = QTableWidgetItem(str(row + 1))
             idx_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+            source_item = QTableWidgetItem(self._cutout_loop_source_name(row))
+            source_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             area_item = QTableWidgetItem(f"{loop.area:.3f}")
             area_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             combo = QComboBox(self.cutout_loop_table)
@@ -2480,8 +3036,9 @@ class MainWindow(QMainWindow):
             combo.setCurrentText(self._cutout_plan_compensations[row])
             combo.currentTextChanged.connect(lambda value, r=row: self._on_cutout_comp_changed(r, value))
             self.cutout_loop_table.setItem(row, 0, idx_item)
-            self.cutout_loop_table.setItem(row, 1, area_item)
-            self.cutout_loop_table.setCellWidget(row, 2, combo)
+            self.cutout_loop_table.setItem(row, 1, source_item)
+            self.cutout_loop_table.setItem(row, 2, area_item)
+            self.cutout_loop_table.setCellWidget(row, 3, combo)
         self.cutout_loop_table.blockSignals(False)
         if self.cutout_loop_table.rowCount() > 0:
             self.cutout_loop_table.selectRow(0)
@@ -2504,19 +3061,23 @@ class MainWindow(QMainWindow):
         self._refresh_canvas(fit=False)
 
     def _update_cutout_source_label(self) -> None:
-        if self._cutout_plan_source_layer_index is None:
+        source_indices = self._active_cutout_source_indices()
+        if not source_indices:
             self.cutout_source_label.setText("Source: (none)")
             self._update_cutout_preview_state_hint()
             return
-        layer = self.project.layers[self._cutout_plan_source_layer_index]
-        self.cutout_source_label.setText(f"Source: {layer.name} ({len(self._cutout_plan_loops)} loops)")
+        source_layers = [self.project.layers[idx] for idx in source_indices]
+        self.cutout_source_label.setText(
+            f"Source: {self._source_layers_label(source_layers)} ({len(self._cutout_plan_loops)} loops)"
+        )
         self._update_cutout_preview_state_hint()
 
     def _update_cutout_preview_state_hint(self) -> None:
         if not hasattr(self, "cutout_preview_state_label"):
             return
         label = self.cutout_preview_state_label
-        if not self._cutout_plan_active or self._cutout_plan_source_layer_index is None:
+        source_indices = self._active_cutout_source_indices()
+        if not self._cutout_plan_active or not source_indices:
             label.setText("Preview status: inactive.")
             label.setStyleSheet("color: #7f8c9a;")
             return
@@ -2524,7 +3085,7 @@ class MainWindow(QMainWindow):
             label.setText("Preview disabled: reopen the Cutout Planner to re-enable preview.")
             label.setStyleSheet("color: #f0b429;")
             return
-        if self._has_generated_cutout_toolpath(source_layer_index=self._cutout_plan_source_layer_index):
+        if self._has_generated_cutout_toolpath(source_layer_indices=source_indices):
             label.setText(
                 "Preview disabled: generated cutout toolpath exists. Delete that cutout toolpath layer to re-enable preview."
             )
@@ -2554,35 +3115,40 @@ class MainWindow(QMainWindow):
             self._cancel_cutout_preview_task(clear_pending=True, clear_cache=False)
             self._remove_cutout_preview_item()
             return
-        if not self._cutout_plan_active or self._cutout_plan_source_layer_index is None:
+        source_indices = self._active_cutout_source_indices()
+        if not self._cutout_plan_active or not source_indices:
             self._update_cutout_preview_state_hint()
             return
         if self._cutout_preview_locked_until_reopen:
             self._cancel_cutout_preview_task(clear_pending=True, clear_cache=True)
             self._update_cutout_preview_state_hint()
             return
-        idx = self._cutout_plan_source_layer_index
-        if idx < 0 or idx >= len(self.project.layers):
+        if any(idx < 0 or idx >= len(self.project.layers) for idx in source_indices):
             self._update_cutout_preview_state_hint()
             return
-        if self._has_generated_cutout_toolpath(source_layer_index=idx):
+        if self._has_generated_cutout_toolpath(source_layer_indices=source_indices):
             # Arm lock so deleting generated output does not auto-enable preview.
             self._cutout_preview_locked_until_reopen = True
             self._cancel_cutout_preview_task(clear_pending=True, clear_cache=True)
             self._update_cutout_preview_state_hint()
             return
-        source_layer = self.project.layers[idx]
+        source_layers = [self.project.layers[idx] for idx in source_indices]
         params = CutoutParams(
             tool_diameter_mm=self._active_cutout_tool_diameter_mm(),
             compensation="outside",
             loop_compensations=list(self._cutout_plan_compensations),
+            holding_tab_count=int(self.cutout_tab_count_spin.value()),
+            holding_tab_width_mm=float(self.cutout_tab_width_spin.value()),
         )
         self._preview_request_token += 1
         self._preview_pending_payload = {
             "token": int(self._preview_request_token),
-            "source_layer_index": int(idx),
-            "source_layer": serialize_layer(source_layer),
+            "source_layer_index": int(source_indices[0]),
+            "source_layer_indices": list(source_indices),
+            "source_layer": serialize_layer(source_layers[0]),
+            "source_layers": [serialize_layer(layer) for layer in source_layers],
             "params": cutout_params_payload(params),
+            "loop_compensations_by_layer": self._cutout_loop_compensations_by_source(len(source_layers)),
         }
         if self._task_running:
             # Queue latest payload; _finish_task_state() will trigger preview start.
@@ -2607,10 +3173,14 @@ class MainWindow(QMainWindow):
         self._preview_task_process = mp.Process(
             target=run_task_process_entry,
             args=(
-                "cutout_generate",
+                "cutout_generate_multi"
+                if len(list(payload.get("source_layers", []) or [])) > 1
+                else "cutout_generate",
                 {
                     "source_layer": payload["source_layer"],
+                    "source_layers": payload.get("source_layers", []),
                     "params": payload["params"],
+                    "loop_compensations_by_layer": payload.get("loop_compensations_by_layer", []),
                 },
                 self._preview_task_queue,
             ),
@@ -2690,13 +3260,19 @@ class MainWindow(QMainWindow):
             self._clear_cutout_preview()
         self._update_cutout_preview_state_hint()
 
-    def _has_generated_cutout_toolpath(self, *, source_layer_index: int | None) -> bool:
-        src_name = None
-        if (
-            source_layer_index is not None
-            and 0 <= int(source_layer_index) < len(self.project.layers)
-        ):
-            src_name = str(self.project.layers[int(source_layer_index)].name)
+    def _has_generated_cutout_toolpath(
+        self,
+        *,
+        source_layer_index: int | None = None,
+        source_layer_indices: list[int] | None = None,
+    ) -> bool:
+        source_names: set[str] = set()
+        indices = list(source_layer_indices or [])
+        if not indices and source_layer_index is not None:
+            indices = [int(source_layer_index)]
+        for idx in indices:
+            if 0 <= int(idx) < len(self.project.layers):
+                source_names.add(str(self.project.layers[int(idx)].name))
 
         for layer in self.project.layers:
             meta = getattr(layer, "metadata", {}) or {}
@@ -2705,10 +3281,14 @@ class MainWindow(QMainWindow):
                 continue
             if str(meta.get("preview", "")).strip().lower() in {"1", "true", "yes", "on"}:
                 continue
-            if src_name is None:
+            if not source_names:
                 return True
-            derived = str(meta.get("derived_from", "")).strip()
-            if not derived or derived == src_name:
+            derived_names = {
+                part.strip()
+                for part in str(meta.get("derived_from", "")).split(",")
+                if part.strip()
+            }
+            if not derived_names or bool(derived_names & source_names):
                 return True
         return False
 
@@ -2722,7 +3302,7 @@ class MainWindow(QMainWindow):
         if self._cutout_preview_locked_until_reopen:
             self._clear_cutout_preview()
             return
-        if self._has_generated_cutout_toolpath(source_layer_index=self._cutout_plan_source_layer_index):
+        if self._has_generated_cutout_toolpath(source_layer_indices=self._active_cutout_source_indices()):
             self._cutout_preview_locked_until_reopen = True
             self._clear_cutout_preview()
             return
@@ -2867,6 +3447,9 @@ class MainWindow(QMainWindow):
             self.generate_drill_toolpath_action,
             self.generate_centering_holes_action,
             self.generate_surfacing_toolpath_action,
+            self.mirror_layer_action,
+            self.mirror_bottom_centering_action,
+            self.reassign_layer_roles_action,
             self.tool_library_action,
             self.selected_tools_action,
             self.renderer_qt_action,
@@ -2881,8 +3464,13 @@ class MainWindow(QMainWindow):
             self.layers_activity_metadata_btn.setEnabled(enabled)
         if self.layers_activity_cutout_btn is not None:
             self.layers_activity_cutout_btn.setEnabled(enabled)
+        if self.mirror_layer_button is not None:
+            self.mirror_layer_button.setEnabled(enabled and bool(self._loaded_layer_indices()))
+        if self.reassign_layers_button is not None:
+            self.reassign_layers_button.setEnabled(enabled and bool(self._loaded_layer_indices()))
         self.cutout_apply_button.setEnabled(enabled)
         self.cutout_close_button.setEnabled(enabled)
+        self._sync_mirror_layer_controls()
 
     def _select_cutout_loop_at(self, x_mm: float, y_mm: float) -> bool:
         if not self._cutout_plan_loops:

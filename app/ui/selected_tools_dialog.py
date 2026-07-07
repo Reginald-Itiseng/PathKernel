@@ -131,8 +131,13 @@ class SelectedToolsDialog(QDialog):
             "Use one single tool for all drills, with circular boring",
             section_one,
         )
+        self.drill_allow_oversize_check = QCheckBox(
+            "Allow this tool to drill holes smaller than its diameter",
+            section_one,
+        )
         self.drill_single_tool_combo = QComboBox(section_one)
         section_one_layout.addWidget(self.drill_single_boring_check)
+        section_one_layout.addWidget(self.drill_allow_oversize_check)
         section_one_layout.addWidget(self.drill_single_tool_combo)
         drill_layout.addWidget(section_one)
 
@@ -238,6 +243,7 @@ class SelectedToolsDialog(QDialog):
             "centering_hole_diameter_mm": float(self.centering_hole_diameter_spin.value()),
             "centering_extra_depth_mm": float(self.centering_extra_depth_spin.value()),
             "drill_use_single_tool_boring": bool(self.drill_single_boring_check.isChecked()),
+            "drill_allow_oversize_tool_for_small_holes": bool(self.drill_allow_oversize_check.isChecked()),
             "drill_single_tool_slot": self._combo_value(self.drill_single_tool_combo),
             "drill_use_closest_smaller_boring": bool(self.drill_closest_smaller_check.isChecked()),
             "drill_use_closest_greater_no_boring": bool(self.drill_closest_greater_check.isChecked()),
@@ -363,6 +369,9 @@ class SelectedToolsDialog(QDialog):
         self.centering_extra_depth_spin.setValue(float(self._assignments["centering_extra_depth_mm"]))
 
         self.drill_single_boring_check.setChecked(bool(self._assignments["drill_use_single_tool_boring"]))
+        self.drill_allow_oversize_check.setChecked(
+            bool(self._assignments["drill_allow_oversize_tool_for_small_holes"])
+        )
         self.drill_closest_smaller_check.setChecked(bool(self._assignments["drill_use_closest_smaller_boring"]))
         self.drill_closest_greater_check.setChecked(bool(self._assignments["drill_use_closest_greater_no_boring"]))
         self._coerce_single_drill_strategy()
@@ -467,6 +476,7 @@ class SelectedToolsDialog(QDialog):
         self.drill_single_tool_combo.setEnabled(
             bool(self.drill_single_boring_check.isChecked()) and self.drill_single_tool_combo.count() > 1
         )
+        self.drill_allow_oversize_check.setEnabled(bool(self.drill_single_boring_check.isChecked()))
         series_enabled = bool(self.drill_closest_smaller_check.isChecked() or self.drill_closest_greater_check.isChecked())
         self.drill_add_series_button.setEnabled(series_enabled)
         for row, _, _ in self._drill_series_rows:
@@ -564,6 +574,7 @@ class SelectedToolsDialog(QDialog):
             "centering_hole_diameter_mm": 0.0,
             "centering_extra_depth_mm": 0.0,
             "drill_use_single_tool_boring": False,
+            "drill_allow_oversize_tool_for_small_holes": False,
             "drill_single_tool_slot": None,
             "drill_use_closest_smaller_boring": False,
             "drill_use_closest_greater_no_boring": False,
@@ -603,6 +614,9 @@ class SelectedToolsDialog(QDialog):
         base["centering_extra_depth_mm"] = self._as_float(assignments.get("centering_extra_depth_mm"), 0.0)
 
         base["drill_use_single_tool_boring"] = self._as_bool(assignments.get("drill_use_single_tool_boring"), False)
+        base["drill_allow_oversize_tool_for_small_holes"] = self._as_bool(
+            assignments.get("drill_allow_oversize_tool_for_small_holes"), False
+        )
         single_slot = assignments.get("drill_single_tool_slot")
         base["drill_single_tool_slot"] = int(single_slot) if isinstance(single_slot, int) else None
         base["drill_use_closest_smaller_boring"] = self._as_bool(

@@ -329,6 +329,7 @@ class PyQtGraphCanvas(QWidget):
                 self._plot.addItem(fill_item)
                 self._items.append(fill_item)
                 added.append(fill_item)
+            _apply_layer_z_values(added, layer, layer_index)
             self._layer_items[layer_index] = list(added)
             return added
 
@@ -432,6 +433,7 @@ class PyQtGraphCanvas(QWidget):
                     "width_items": width_items,
                 }
             )
+        _apply_layer_z_values(added, layer, layer_index)
         self._layer_items[layer_index] = list(added)
         return added
 
@@ -633,10 +635,10 @@ class PyQtGraphCanvas(QWidget):
         if not candidates:
             return None, None
         if preferred_layer_index is not None:
-            for layer_index, info in candidates:
-                if layer_index == preferred_layer_index:
-                    return layer_index, info
-        return candidates[-1]
+            preferred = [(layer_index, info) for layer_index, info in candidates if layer_index == preferred_layer_index]
+            if preferred:
+                return _best_hit_candidate(preferred)
+        return _best_hit_candidate(candidates)
 
     def debug_dump_at(
         self,
@@ -1581,6 +1583,35 @@ def _entry_contains_point(entry: dict[str, object], pt: QPointF, tol: float = 0.
     return bool(hit.contains(pt))
 
 
+def _best_hit_candidate(candidates: list[tuple[int, dict[str, str]]]) -> tuple[int | None, dict[str, str] | None]:
+    if not candidates:
+        return None, None
+    indexed = list(enumerate(candidates))
+    _, best = min(indexed, key=lambda item: _hit_candidate_score(item[0], item[1]))
+    return best
+
+
+def _hit_candidate_score(order: int, candidate: tuple[int, dict[str, str]]) -> tuple[float, float, float, int]:
+    _layer_index, info = candidate
+    kind = str(info.get("shape_kind", "")).strip().lower()
+    primitive_type = str(info.get("primitive_type", "")).strip().lower()
+    flashed = str(info.get("flashed", "")).strip().lower() == "true"
+    try:
+        w = max(0.0, float(info.get("bounds_width_mm", "0") or 0.0))
+        h = max(0.0, float(info.get("bounds_height_mm", "0") or 0.0))
+    except Exception:
+        w = h = 0.0
+    area = w * h
+    pad_like = flashed or primitive_type in {"circle", "rectangle", "obround", "roundrectangle", "polygon"}
+    # Prefer small flashed/fill geometry over wide traces when they overlap.
+    return (
+        0.0 if pad_like else 1.0,
+        0.0 if kind == "fill" else 1.0,
+        area if area > 0.0 else float("inf"),
+        -int(order),
+    )
+
+
 def _layer_qtransform(layer: Layer) -> QTransform:
     t = QTransform()
     sx = -1.0 if bool(getattr(layer, "mirror_x", False)) else 1.0
@@ -1618,6 +1649,28 @@ def _toolpath_kind(layer: Layer) -> str | None:
     }:
         return kind
     return None
+
+
+def _layer_z_value(layer: Layer, layer_index: int) -> float:
+    role = str(getattr(layer, "role", "") or "").strip().lower()
+    kind = str(getattr(layer, "kind", "") or "").strip().lower()
+    meta_kind = str((getattr(layer, "metadata", {}) or {}).get("kind", "")).strip().lower()
+    if role in {"drills", "holes"} or kind == "excellon":
+        return 80.0
+    if meta_kind in {"drill_toolpath", "centering_holes_toolpath"}:
+        return 150.0
+    if meta_kind in {"isolation", "hatching_toolpath", "cutout_toolpath", "surfacing_toolpath"}:
+        return 120.0
+    return float(min(max(layer_index, 0), 50))
+
+
+def _apply_layer_z_values(items: list[object], layer: Layer, layer_index: int) -> None:
+    z_value = _layer_z_value(layer, layer_index)
+    for item in items:
+        try:
+            item.setZValue(z_value)
+        except Exception:
+            pass
 
 
 def _toolpath_centerline_width(base_width: float) -> float:

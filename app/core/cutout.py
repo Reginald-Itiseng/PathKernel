@@ -18,6 +18,8 @@ class CutoutParams:
     tool_diameter_mm: float
     compensation: str = "outside"  # "outside" | "inside" | "onpath"
     loop_compensations: list[str] | None = None
+    holding_tab_count: int = 0
+    holding_tab_width_mm: float = 1.0
 
 
 @dataclass(slots=True)
@@ -60,8 +62,18 @@ def build_cutout_toolpath_layer(
         path_geoms.append(path_geom)
         resolved_comp.append(comp)
 
+    tab_count = max(0, int(params.holding_tab_count))
+    tab_width = max(0.0, float(params.holding_tab_width_mm))
+    if tab_count > 0 and tab_width > 0.0:
+        _log(log, f"cutout: adding {tab_count} holding break(s), width={tab_width:.4f}mm")
+
     _log(log, "cutout: converting paths to primitives")
-    primitives = _line_primitives_from_paths(path_geoms, params.tool_diameter_mm)
+    primitives = _line_primitives_from_paths(
+        path_geoms,
+        params.tool_diameter_mm,
+        holding_tab_count=tab_count,
+        holding_tab_width_mm=tab_width,
+    )
     if not primitives:
         raise ValueError("Generated cutout toolpath is empty.")
 
@@ -78,6 +90,8 @@ def build_cutout_toolpath_layer(
         "tool_diameter_mm": f"{params.tool_diameter_mm:.6f}",
         "compensation": ",".join(resolved_comp),
         "loop_count": str(len(loops)),
+        "holding_tab_count": str(tab_count),
+        "holding_tab_width_mm": f"{tab_width:.6f}",
     }
     return Layer(
         name=f"{source_layer.name}_cutout_tp",
@@ -103,7 +117,8 @@ def extract_cutout_loops(layer: Layer, log: callable | None = None) -> list[Poly
     snap_tol = _estimate_snap_tolerance(segments)
     snapped_segments = _snap_segment_endpoints(segments, tol=snap_tol)
     _log(log, "cutout: merging and polygonizing segments")
-    merged = linemerge(unary_union(snapped_segments))
+    merged_source = unary_union(snapped_segments)
+    merged = merged_source if getattr(merged_source, "geom_type", "") == "LineString" else linemerge(merged_source)
     loops: list[Polygon] = []
     loops.extend(_polygons_from_near_closed_lines(merged))
 
@@ -368,10 +383,22 @@ def _collect_outline_centerline_segments(layer: Layer) -> list[LineString]:
     return [_apply_layer_transform(seg, layer) for seg in segments if seg is not None and not seg.is_empty]
 
 
-def _line_primitives_from_paths(path_geoms: list[Any], tool_dia: float) -> list[Any]:
+def _line_primitives_from_paths(
+    path_geoms: list[Any],
+    tool_dia: float,
+    *,
+    holding_tab_count: int = 0,
+    holding_tab_width_mm: float = 0.0,
+) -> list[Any]:
     out: list[Any] = []
     for path_geom in path_geoms:
-        out.extend(_line_primitives_from_path(path_geom, tool_dia))
+        tabbed_paths = _split_path_for_holding_tabs(
+            path_geom,
+            count=holding_tab_count,
+            width_mm=holding_tab_width_mm,
+        )
+        for tabbed_path in tabbed_paths:
+            out.extend(_line_primitives_from_path(tabbed_path, tool_dia))
     return out
 
 
@@ -392,6 +419,100 @@ def _line_primitives_from_path(path_geom, tool_dia: float) -> list[Any]:
             )
         )
     return out
+
+
+def _split_path_for_holding_tabs(path_geom, *, count: int, width_mm: float) -> list[LineString]:
+    coords = [(float(x), float(y)) for x, y in list(getattr(path_geom, "coords", []) or [])]
+    if len(coords) < 2:
+        return []
+    line = LineString(coords)
+    length = float(line.length)
+    tab_count = max(0, int(count))
+    tab_width = max(0.0, float(width_mm))
+    if tab_count <= 0 or tab_width <= 0.0 or length <= tab_width:
+        return [line]
+
+    safe_width = min(tab_width, length / max(1, tab_count * 2))
+    intervals: list[tuple[float, float]] = []
+    for idx in range(tab_count):
+        center = (idx + 0.5) * (length / tab_count)
+        start = center - (safe_width * 0.5)
+        end = center + (safe_width * 0.5)
+        intervals.append((max(0.0, start), min(length, end)))
+
+    cut_parts: list[tuple[float, float]] = []
+    cursor = 0.0
+    for start, end in intervals:
+        if start > cursor:
+            cut_parts.append((cursor, start))
+        cursor = max(cursor, end)
+    if cursor < length:
+        cut_parts.append((cursor, length))
+
+    out: list[LineString] = []
+    for start, end in cut_parts:
+        segment = _line_substring(line, start, end)
+        if segment is not None and not segment.is_empty and segment.length > 1e-9:
+            out.append(segment)
+    return out
+
+
+def _line_substring(line: LineString, start_dist: float, end_dist: float) -> LineString | None:
+    length = float(line.length)
+    start = max(0.0, min(length, float(start_dist)))
+    end = max(0.0, min(length, float(end_dist)))
+    if end <= start:
+        return None
+
+    coords = [(float(x), float(y)) for x, y in list(line.coords)]
+    if len(coords) < 2:
+        return None
+
+    out: list[tuple[float, float]] = []
+    travelled = 0.0
+    for a, b in zip(coords, coords[1:]):
+        ax, ay = a
+        bx, by = b
+        seg_len = math.hypot(bx - ax, by - ay)
+        if seg_len <= 1e-12:
+            continue
+        seg_start = travelled
+        seg_end = travelled + seg_len
+        if seg_end < start:
+            travelled = seg_end
+            continue
+        if seg_start > end:
+            break
+
+        local_start = max(start, seg_start)
+        local_end = min(end, seg_end)
+        if local_end < local_start:
+            travelled = seg_end
+            continue
+
+        p0 = _interpolate_segment(a, b, (local_start - seg_start) / seg_len)
+        p1 = _interpolate_segment(a, b, (local_end - seg_start) / seg_len)
+        if not out or math.hypot(out[-1][0] - p0[0], out[-1][1] - p0[1]) > 1e-9:
+            out.append(p0)
+        if math.hypot(out[-1][0] - p1[0], out[-1][1] - p1[1]) > 1e-9:
+            out.append(p1)
+        travelled = seg_end
+
+    if len(out) < 2:
+        return None
+    return LineString(out)
+
+
+def _interpolate_segment(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    t: float,
+) -> tuple[float, float]:
+    clamped = max(0.0, min(1.0, float(t)))
+    return (
+        float(a[0]) + ((float(b[0]) - float(a[0])) * clamped),
+        float(a[1]) + ((float(b[1]) - float(a[1])) * clamped),
+    )
 
 
 def _normalize_compensation(value: str) -> str:

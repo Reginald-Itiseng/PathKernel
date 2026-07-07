@@ -214,6 +214,7 @@ class GraphicsCanvas(QGraphicsView):
             drill_view_mode=self._drill_view_mode,
         )
         item.setOpacity(1.0)
+        item.setZValue(_layer_z_value(layer, layer_index))
         self.scene().addItem(item)
         return item
 
@@ -474,10 +475,10 @@ class GraphicsCanvas(QGraphicsView):
         if not hits:
             return None, None
         if preferred_layer_index is not None:
-            for layer_index, info in hits:
-                if layer_index == preferred_layer_index:
-                    return layer_index, info
-        return hits[0]
+            preferred = [(layer_index, info) for layer_index, info in hits if layer_index == preferred_layer_index]
+            if preferred:
+                return _best_hit_candidate(preferred)
+        return _best_hit_candidate(hits)
 
     def debug_dump_at(
         self,
@@ -1017,6 +1018,52 @@ class _TaskTextOverlay(QWidget):
             painter.end()
 
 
+def _layer_z_value(layer: Layer, layer_index: int) -> float:
+    role = str(getattr(layer, "role", "") or "").strip().lower()
+    kind = str(getattr(layer, "kind", "") or "").strip().lower()
+    meta_kind = str((getattr(layer, "metadata", {}) or {}).get("kind", "")).strip().lower()
+    if role in {"drills", "holes"} or kind == "excellon":
+        return 80.0
+    if meta_kind in {"drill_toolpath", "centering_holes_toolpath"}:
+        return 150.0
+    if meta_kind in {"isolation", "hatching_toolpath", "cutout_toolpath", "surfacing_toolpath"}:
+        return 120.0
+    return float(min(max(layer_index, 0), 50))
+
+
+def _best_hit_candidate(candidates: list[tuple[int, dict[str, str]]]) -> tuple[int | None, dict[str, str] | None]:
+    if not candidates:
+        return None, None
+    indexed = list(enumerate(candidates))
+    _, best = min(indexed, key=lambda item: _hit_candidate_score(item[0], item[1][1]))
+    return best
+
+
+def _best_shape_hit(candidates: list[dict[str, str]]) -> dict[str, str]:
+    indexed = list(enumerate(candidates))
+    _, best = min(indexed, key=lambda item: _hit_candidate_score(item[0], item[1]))
+    return best
+
+
+def _hit_candidate_score(order: int, info: dict[str, str]) -> tuple[float, float, float, int]:
+    kind = str(info.get("shape_kind", "")).strip().lower()
+    primitive_type = str(info.get("primitive_type", "")).strip().lower()
+    flashed = str(info.get("flashed", "")).strip().lower() == "true"
+    try:
+        w = max(0.0, float(info.get("bounds_width_mm", "0") or 0.0))
+        h = max(0.0, float(info.get("bounds_height_mm", "0") or 0.0))
+    except Exception:
+        w = h = 0.0
+    area = w * h
+    pad_like = flashed or primitive_type in {"circle", "rectangle", "obround", "roundrectangle", "polygon"}
+    return (
+        0.0 if pad_like else 1.0,
+        0.0 if kind == "fill" else 1.0,
+        area if area > 0.0 else float("inf"),
+        -int(order),
+    )
+
+
 class CAMLayerItem(QGraphicsItem):
     """Scene item that paints precomputed geometry from core.geometry."""
 
@@ -1150,6 +1197,7 @@ class CAMLayerItem(QGraphicsItem):
 
     def inspect_at(self, scene_pos: QPointF, tolerance: float = 0.12) -> dict[str, str] | None:
         local_pos = self.mapFromScene(scene_pos)
+        candidates: list[dict[str, str]] = []
         for idx in range(len(self._shapes) - 1, -1, -1):
             shape = self._shapes[idx]
             rect = shape.path.boundingRect()
@@ -1163,7 +1211,7 @@ class CAMLayerItem(QGraphicsItem):
                         info["bounds_width_mm"] = f"{max(0.0, float(rect.width())):.6f}"
                     if "bounds_height_mm" not in info:
                         info["bounds_height_mm"] = f"{max(0.0, float(rect.height())):.6f}"
-                    return info
+                    candidates.append(info)
             else:
                 stroker = QPainterPathStroker()
                 stroker.setWidth(max(shape.line_width, tolerance))
@@ -1177,8 +1225,10 @@ class CAMLayerItem(QGraphicsItem):
                         info["bounds_width_mm"] = f"{max(0.0, float(rect.width())):.6f}"
                     if "bounds_height_mm" not in info:
                         info["bounds_height_mm"] = f"{max(0.0, float(rect.height())):.6f}"
-                    return info
-        return None
+                    candidates.append(info)
+        if not candidates:
+            return None
+        return _best_shape_hit(candidates)
 
     def _draw_direction_arrows(self, painter: QPainter, path, *, color: QColor, line_width: float) -> None:
         points = self._path_points(path)

@@ -16,6 +16,7 @@ class DrillToolpathParams:
     boring_cycle_mode: str = "drill_at_center"
     drilling_depth_mm: float = 0.0
     boring_speed_mm_s: float = 0.0
+    allow_oversize_tool_for_small_holes: bool = False
 
 
 @dataclass(slots=True)
@@ -53,21 +54,31 @@ def build_drill_toolpath_layer(
     bore_hole_count = 0
     bore_pass_count = 0
     skipped_too_small = 0
+    oversize_hole_count = 0
 
     for idx, (x, y, hole_dia) in enumerate(holes):
         if hole_dia <= 0.0:
             continue
         if hole_dia < (tool_dia - 0.0005):
-            skipped_too_small += 1
+            if not bool(params.allow_oversize_tool_for_small_holes):
+                skipped_too_small += 1
+                _log(
+                    log,
+                    (
+                        f"drill: skipping hole {idx + 1}/{len(holes)} dia={hole_dia:.4f}mm "
+                        f"(smaller than tool {tool_dia:.4f}mm)"
+                    ),
+                )
+                continue
+            oversize_hole_count += 1
             _log(
                 log,
                 (
-                    f"drill: skipping hole {idx + 1}/{len(holes)} dia={hole_dia:.4f}mm "
-                    f"(smaller than tool {tool_dia:.4f}mm)"
+                    f"drill: hole {idx + 1}/{len(holes)} dia={hole_dia:.4f}mm "
+                    f"will be drilled oversize with tool {tool_dia:.4f}mm"
                 ),
             )
-            continue
-        orbit_radius = (hole_dia - tool_dia) * 0.5
+        orbit_radius = max(0.0, (hole_dia - tool_dia) * 0.5)
         # Strategy A semantics:
         # - always plunge at center first (represented by a tiny line segment),
         # - if hole > tool, add concentric full arcs for boring expansion.
@@ -125,7 +136,10 @@ def build_drill_toolpath_layer(
     if not out_primitives:
         raise ValueError("Drill toolpath generation produced no commands. Tool may be too large for all holes.")
 
-    bounds = _bounds_from_holes(holes)
+    bounds = _bounds_from_holes(
+        holes,
+        min_diameter_mm=tool_dia if bool(params.allow_oversize_tool_for_small_holes) else 0.0,
+    )
     source = _DerivedSource(units="mm", primitives=out_primitives, bounds=bounds)
     name = f"{source_layer.name}_drill"
     meta = {
@@ -147,6 +161,8 @@ def build_drill_toolpath_layer(
         "drill_bore_hole_count": str(bore_hole_count),
         "drill_bore_pass_count": str(bore_pass_count),
         "drill_skipped_small_holes": str(skipped_too_small),
+        "drill_oversize_small_holes": str(oversize_hole_count),
+        "drill_allow_oversize_tool_for_small_holes": str(bool(params.allow_oversize_tool_for_small_holes)),
     }
     return Layer(
         name=name,
@@ -219,15 +235,20 @@ def _apply_layer_transform_xy(x: float, y: float, layer: Layer) -> tuple[float, 
     return out_x, out_y
 
 
-def _bounds_from_holes(holes: list[tuple[float, float, float]]) -> tuple[tuple[float, float], tuple[float, float]] | None:
+def _bounds_from_holes(
+    holes: list[tuple[float, float, float]],
+    *,
+    min_diameter_mm: float = 0.0,
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
     if not holes:
         return None
     min_x = float("inf")
     min_y = float("inf")
     max_x = float("-inf")
     max_y = float("-inf")
+    min_dia = max(0.0, float(min_diameter_mm))
     for x, y, dia in holes:
-        r = max(0.0, dia * 0.5)
+        r = max(0.0, max(float(dia), min_dia) * 0.5)
         min_x = min(min_x, x - r)
         min_y = min(min_y, y - r)
         max_x = max(max_x, x + r)

@@ -5,7 +5,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.centering_holes import CenteringHolesParams, build_centering_holes_toolpath_layer
+from app.core.centering_holes import (
+    CenteringHolesParams,
+    build_centering_holes_toolpath_layer,
+    centering_hole_mirror_axis,
+)
 from app.core.project import Layer, Project
 
 
@@ -43,6 +47,7 @@ def test_centering_horizontal_positions() -> None:
     assert float(lines[0].start[1]) == pytest.approx(25.0)
     assert float(lines[1].start[0]) == pytest.approx(110.0)
     assert float(lines[1].start[1]) == pytest.approx(25.0)
+    assert centering_hole_mirror_axis(layer) == ("mirror_y", pytest.approx(25.0))
 
 
 def test_centering_vertical_boring_passes_when_hole_larger_than_tool() -> None:
@@ -66,6 +71,7 @@ def test_centering_vertical_boring_passes_when_hole_larger_than_tool() -> None:
     assert len(list(layer.source.primitives)) == 6
     assert layer.metadata.get("centering_bore_hole_count") == "2"
     assert layer.metadata.get("centering_bore_pass_count") == "4"
+    assert centering_hole_mirror_axis(layer) == ("mirror_x", pytest.approx(50.0))
 
 
 def test_centering_rejects_invalid_bounds() -> None:

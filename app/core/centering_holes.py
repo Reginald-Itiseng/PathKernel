@@ -153,6 +153,42 @@ def build_centering_holes_toolpath_layer(
     )
 
 
+def centering_hole_mirror_axis(layer: Layer) -> tuple[str, float] | None:
+    """Return the reflection axis implied by a centering-holes toolpath layer.
+
+    The axis name matches the layer transform flag to toggle:
+    - ``"mirror_y"`` reflects across the horizontal line through left/right holes.
+    - ``"mirror_x"`` reflects across the vertical line through top/bottom holes.
+    """
+    kind = str((getattr(layer, "metadata", {}) or {}).get("kind", "")).strip().lower()
+    if kind != "centering_holes_toolpath":
+        return None
+
+    centers: list[tuple[float, float]] = []
+    for primitive in list(getattr(getattr(layer, "source", None), "primitives", []) or []):
+        if hasattr(primitive, "center"):
+            continue
+        start = getattr(primitive, "start", None)
+        end = getattr(primitive, "end", None)
+        if not (_is_xy_pair(start) and _is_xy_pair(end)):
+            continue
+        sx, sy = float(start[0]), float(start[1])
+        ex, ey = float(end[0]), float(end[1])
+        if math.hypot(ex - sx, ey - sy) > 0.01:
+            continue
+        centers.append((sx, sy))
+        if len(centers) >= 2:
+            break
+
+    if len(centers) < 2:
+        return None
+
+    (x0, y0), (x1, y1) = centers[:2]
+    if abs(x1 - x0) >= abs(y1 - y0):
+        return "mirror_y", (y0 + y1) * 0.5
+    return "mirror_x", (x0 + x1) * 0.5
+
+
 def _centering_hole_centers(
     *,
     min_x: float,
@@ -175,6 +211,17 @@ def _normalize_orientation(value: str) -> str:
     if out not in {"horizontal", "vertical"}:
         return "horizontal"
     return out
+
+
+def _is_xy_pair(value: Any) -> bool:
+    if not isinstance(value, (tuple, list)) or len(value) != 2:
+        return False
+    try:
+        float(value[0])
+        float(value[1])
+    except Exception:
+        return False
+    return True
 
 
 def _log(log: callable | None, msg: str) -> None:

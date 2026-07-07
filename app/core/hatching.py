@@ -54,6 +54,7 @@ def build_hatching_toolpath_layer(
     *,
     keepout_layers: list[Layer] | None = None,
     board_layers: list[Layer] | None = None,
+    copper_keepout_layers: list[Layer] | None = None,
     log: callable | None = None,
 ) -> Layer:
     """Build a copper-clearing hatch toolpath clipped by board domain and keepouts."""
@@ -71,6 +72,7 @@ def build_hatching_toolpath_layer(
     hatch_angle = float(getattr(params, "hatch_angle_deg", 0.0) or 0.0)
     copper_keepout_margin = max(0.0, float(getattr(params, "copper_keepout_margin_mm", 0.0) or 0.0))
     boundary_margin = max(0.0, float(getattr(params, "boundary_margin_mm", 0.0) or 0.0))
+    safety_clearance = max(0.005, effective_radius * 0.02)
 
     _log(
         log,
@@ -83,7 +85,7 @@ def build_hatching_toolpath_layer(
         ),
     )
 
-    board_domain = _board_domain_from_layers(board_layers or [], log=log)
+    board_domain = _board_domain_from_layers(board_layers or [], copper=copper, log=log)
     if board_layers and (board_domain is None or board_domain.is_empty):
         raise ValueError("Could not derive a valid board cutout domain from cutout layers.")
 
@@ -99,7 +101,15 @@ def build_hatching_toolpath_layer(
             float(max_y + boundary_margin),
         )
 
-    copper_keepout = copper.buffer(effective_radius + copper_keepout_margin, join_style=join_style)
+    selected_copper_keepout = _copper_keepout_from_layers(copper_keepout_layers or [])
+    copper_for_keepout = copper
+    if selected_copper_keepout is not None and not selected_copper_keepout.is_empty:
+        copper_for_keepout = unary_union([copper, selected_copper_keepout])
+
+    copper_keepout = copper_for_keepout.buffer(
+        effective_radius + copper_keepout_margin + safety_clearance,
+        join_style=join_style,
+    )
     clear_region = clear_domain.difference(copper_keepout)
     if clear_region is None or clear_region.is_empty:
         raise ValueError("No hatchable region remains after copper keepout.")
@@ -116,6 +126,14 @@ def build_hatching_toolpath_layer(
         raise ValueError("No hatchable region remains after existing toolpath keepout.")
 
     hatch_lines = _hatch_lines(clear_region, step=step, angle_deg=hatch_angle)
+    hatch_lines = _filter_hatch_lines_against_copper(
+        hatch_lines,
+        copper=copper_for_keepout,
+        tool_radius=effective_radius,
+        copper_keepout_margin=copper_keepout_margin,
+        safety_clearance=safety_clearance,
+        join_style=join_style,
+    )
     if not hatch_lines:
         raise ValueError("No hatching toolpaths were generated with current parameters.")
 
@@ -140,9 +158,11 @@ def build_hatching_toolpath_layer(
         "hatching_step_mm": f"{step:.6f}",
         "hatching_angle_deg": f"{hatch_angle:.3f}",
         "hatching_copper_keepout_margin_mm": f"{copper_keepout_margin:.6f}",
+        "hatching_safety_clearance_mm": f"{safety_clearance:.6f}",
         "hatching_boundary_margin_mm": f"{boundary_margin:.6f}",
         "hatching_board_cutout_awareness": "true",
         "hatching_board_cutout_layer_count": str(len(list(board_layers or []))),
+        "hatching_copper_keepout_layer_count": str(len(list(copper_keepout_layers or []))),
     }
     return Layer(
         name=f"{source_layer.name}_hatch_tp",
@@ -210,6 +230,49 @@ def _line_primitives_from_lines(lines: list[LineString], tool_dia: float) -> lis
     return out
 
 
+def _filter_hatch_lines_against_copper(
+    lines: list[LineString],
+    *,
+    copper,
+    tool_radius: float,
+    copper_keepout_margin: float,
+    safety_clearance: float,
+    join_style: int,
+) -> list[LineString]:
+    if not lines:
+        return []
+    if copper is None or copper.is_empty:
+        return list(lines)
+
+    forbidden = copper.buffer(
+        max(0.0, float(tool_radius) + float(copper_keepout_margin) + float(safety_clearance)),
+        join_style=join_style,
+    )
+    if forbidden is None or forbidden.is_empty:
+        return list(lines)
+
+    out: list[LineString] = []
+    for line in lines:
+        if line is None or line.is_empty or line.length <= 1e-6:
+            continue
+        try:
+            swept = line.buffer(max(0.0, float(tool_radius)), join_style=join_style)
+            if swept is not None and not swept.is_empty and not swept.intersects(copper):
+                out.append(line)
+                continue
+        except Exception:
+            pass
+
+        try:
+            clipped = line.difference(forbidden)
+        except Exception:
+            continue
+        for safe_line in _iter_lines(clipped):
+            if safe_line is not None and not safe_line.is_empty and safe_line.length > 1e-6:
+                out.append(safe_line)
+    return out
+
+
 def _toolpath_keepout_swept_area(
     layers: list[Layer],
     *,
@@ -239,7 +302,19 @@ def _toolpath_keepout_swept_area(
         return base
 
 
-def _board_domain_from_layers(layers: list[Layer], *, log: callable | None = None):
+def _copper_keepout_from_layers(layers: list[Layer]):
+    parts = []
+    for layer in list(layers or []):
+        copper = _build_copper_geometry(layer)
+        if copper is not None and not copper.is_empty:
+            parts.append(copper)
+    if not parts:
+        return None
+    merged = unary_union(parts)
+    return merged if merged is not None and not merged.is_empty else None
+
+
+def _board_domain_from_layers(layers: list[Layer], *, copper=None, log: callable | None = None):
     loops = []
     for layer in list(layers or []):
         try:
@@ -250,7 +325,34 @@ def _board_domain_from_layers(layers: list[Layer], *, log: callable | None = Non
             loops.extend(layer_loops)
     if not loops:
         return None
-    return _loops_to_domain(loops)
+    domain = _loops_to_domain(loops)
+    if copper is None or getattr(copper, "is_empty", True) or domain is None or domain.is_empty:
+        return domain
+    return _domain_components_touching_copper(domain, copper)
+
+
+def _domain_components_touching_copper(domain, copper):
+    selected = []
+    for part in _iter_polygons(domain):
+        try:
+            if part.intersects(copper) or part.contains(copper.representative_point()):
+                selected.append(part)
+        except Exception:
+            continue
+    if not selected:
+        return None
+    merged = unary_union(selected)
+    return merged if merged is not None and not merged.is_empty else None
+
+
+def _iter_polygons(geom):
+    if geom is None or geom.is_empty:
+        return
+    if geom.geom_type == "Polygon":
+        yield geom
+        return
+    for sub in getattr(geom, "geoms", []) or []:
+        yield from _iter_polygons(sub)
 
 
 def _loops_to_domain(loops: list[Any]):

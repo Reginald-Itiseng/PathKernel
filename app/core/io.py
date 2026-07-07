@@ -22,6 +22,16 @@ GERBER_EXTENSIONS = {
     ".gbs",
     ".gko",
     ".gm1",
+    ".gb0",
+    ".gb1",
+    ".gb2",
+    ".gb3",
+    ".gb4",
+    ".gb5",
+    ".gb6",
+    ".gb7",
+    ".gb8",
+    ".gb9",
     ".gbr",
     ".art",
     ".pho",
@@ -208,7 +218,7 @@ def _guess_role(path: Path, kind: str) -> str:
         return "cutout"
     if "f_cu" in name or "top" in name or ext in {".gtl"}:
         return "top"
-    if "b_cu" in name or "bottom" in name or ext in {".gbl"}:
+    if "b_cu" in name or "bottom" in name or ext in {".gbl", ".gb1"}:
         return "bottom"
     # Default ambiguous Gerber layers to artwork so users can reassign explicitly.
     if kind == "gerber":
@@ -498,6 +508,40 @@ def _adapt_gerbonara_graphic_primitive(obj: Any, fallback_polarity: str) -> Any 
                 return Polygon(vertices=verts, flashed=True, level_polarity=polarity)
         except Exception:
             return None
+
+    # CenterLine / VectorLine: rectangular aperture-macro primitives defined by
+    # a center point, width, height and optional rotation — same shape as a
+    # rotated rectangle.
+    if ("centerline" in cls or "vectorline" in cls) and all(
+        hasattr(obj, name) for name in ("x", "y", "w", "h")
+    ):
+        try:
+            x = float(getattr(obj, "x"))
+            y = float(getattr(obj, "y"))
+            w = float(getattr(obj, "w"))
+            h = float(getattr(obj, "h"))
+            rot = float(getattr(obj, "rotation", 0.0) or 0.0)
+            if w > 0.0 and h > 0.0:
+                if abs(rot) <= 1e-9:
+                    return RoundRectangle(position=(x, y), width=w, height=h, radius=0.0, level_polarity=polarity)
+                verts = _rotated_rect_vertices(x, y, w, h, rot)
+                return Polygon(vertices=verts, flashed=True, level_polarity=polarity)
+        except Exception:
+            return None
+
+    # Outline / Polygon: arbitrary aperture-macro polygon defined by a vertex list.
+    if ("outline" in cls or "polygon" in cls) and hasattr(obj, "outline"):
+        try:
+            outline = list(getattr(obj, "outline") or [])
+            verts2: list[tuple[float, float]] = []
+            for pt in outline:
+                if isinstance(pt, (list, tuple)) and len(pt) >= 2:
+                    verts2.append((float(pt[0]), float(pt[1])))
+            if len(verts2) >= 3:
+                return Polygon(vertices=verts2, flashed=True, level_polarity=polarity)
+        except Exception:
+            return None
+
     return None
 
 

@@ -305,7 +305,8 @@ def _build_copper_geometry(layer: Layer):
 
 
 def _collect_pad_shapes(layer: Layer):
-    pad_classes = {"circle", "obround", "roundrectangle"}
+    # Include amgroup so aperture-macro pads (Altium/PADS/OrCAD) are handled.
+    pad_classes = {"circle", "obround", "roundrectangle", "amgroup"}
     shapes = []
     for primitive in getattr(layer.source, "primitives", []) or []:
         cls = primitive.__class__.__name__.lower()
@@ -446,6 +447,17 @@ def _primitive_to_shape(primitive):
         if not pieces:
             return None
         return unary_union(pieces)
+
+    # AMGroup: aperture-macro flash pads (common in Altium/PADS/OrCAD exports).
+    # Recursively union all sub-primitive shapes so the pad is not silently dropped.
+    if cls == "amgroup":
+        subs = getattr(primitive, "primitives", []) or []
+        pieces = [_primitive_to_shape(sub) for sub in subs]
+        pieces = [p for p in pieces if p is not None and not p.is_empty]
+        if not pieces:
+            return None
+        merged = unary_union(pieces)
+        return merged if not merged.is_empty else None
 
     return None
 

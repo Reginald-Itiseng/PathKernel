@@ -27,6 +27,12 @@ ROLE_OPTIONS: list[tuple[str, str]] = [
     ("Artwork", "artwork"),
 ]
 
+KIND_OPTIONS: list[tuple[str, str]] = [
+    ("Gerber", "gerber"),
+    ("Excellon Drill", "excellon"),
+    ("Geometry", "geometry"),
+]
+
 
 @dataclass(slots=True)
 class LayerRoleEntry:
@@ -53,15 +59,16 @@ class LayerRolesDialog(QDialog):
         self.setWindowTitle(title)
         self.resize(760, 420)
         self._entries = list(entries)
-        self._row_combos: list[QComboBox] = []
+        self._role_combos: list[QComboBox] = []
+        self._kind_combos: list[QComboBox] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
         intro = QLabel(
-            "Review and confirm roles for imported layers. "
-            "These roles control workflow behavior (isolation, drills, cutout).",
+            "Review and confirm layer types and roles. "
+            "Types control which operations can use each layer; roles guide workflows.",
             self,
         )
         intro.setWordWrap(True)
@@ -69,34 +76,39 @@ class LayerRolesDialog(QDialog):
 
         table = QTableWidget(self)
         table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["Layer", "Kind", "File", "Role"])
+        table.setHorizontalHeaderLabels(["Layer", "File", "Type", "Role"])
         table.verticalHeader().setVisible(False)
         table.setRowCount(len(self._entries))
         table.setSelectionMode(QTableWidget.NoSelection)
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.horizontalHeader().setStretchLastSection(False)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         table.setAlternatingRowColors(True)
 
         for row, entry in enumerate(self._entries):
             name_item = QTableWidgetItem(entry.name)
-            kind_item = QTableWidgetItem(entry.kind)
             file_item = QTableWidgetItem(entry.path)
-            for item in (name_item, kind_item, file_item):
+            for item in (name_item, file_item):
                 item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
             table.setItem(row, 0, name_item)
-            table.setItem(row, 1, kind_item)
-            table.setItem(row, 2, file_item)
+            table.setItem(row, 1, file_item)
 
-            combo = QComboBox(table)
+            kind_combo = QComboBox(table)
+            for label, kind in KIND_OPTIONS:
+                kind_combo.addItem(label, kind)
+            kind_combo.setCurrentIndex(self._kind_index(entry.kind))
+            table.setCellWidget(row, 2, kind_combo)
+            self._kind_combos.append(kind_combo)
+
+            role_combo = QComboBox(table)
             for label, role in ROLE_OPTIONS:
-                combo.addItem(label, role)
-            combo.setCurrentIndex(self._role_index(entry.role))
-            table.setCellWidget(row, 3, combo)
-            self._row_combos.append(combo)
+                role_combo.addItem(label, role)
+            role_combo.setCurrentIndex(self._role_index(entry.role))
+            table.setCellWidget(row, 3, role_combo)
+            self._role_combos.append(role_combo)
 
         layout.addWidget(table, 1)
 
@@ -110,9 +122,16 @@ class LayerRolesDialog(QDialog):
 
     def selected_roles(self) -> dict[int, str]:
         out: dict[int, str] = {}
-        for entry, combo in zip(self._entries, self._row_combos):
+        for entry, combo in zip(self._entries, self._role_combos):
             role = str(combo.currentData() or "artwork")
             out[int(entry.layer_index)] = role
+        return out
+
+    def selected_kinds(self) -> dict[int, str]:
+        out: dict[int, str] = {}
+        for entry, combo in zip(self._entries, self._kind_combos):
+            kind = str(combo.currentData() or "gerber")
+            out[int(entry.layer_index)] = kind
         return out
 
     @staticmethod
@@ -123,6 +142,16 @@ class LayerRolesDialog(QDialog):
         if normalized not in {r for _, r in ROLE_OPTIONS}:
             normalized = "artwork"
         for idx, (_label, key) in enumerate(ROLE_OPTIONS):
+            if key == normalized:
+                return idx
+        return 0
+
+    @staticmethod
+    def _kind_index(kind: str) -> int:
+        normalized = str(kind or "").strip().lower()
+        if normalized not in {k for _, k in KIND_OPTIONS}:
+            normalized = "gerber"
+        for idx, (_label, key) in enumerate(KIND_OPTIONS):
             if key == normalized:
                 return idx
         return 0
